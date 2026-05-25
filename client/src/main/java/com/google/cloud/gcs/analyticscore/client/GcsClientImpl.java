@@ -125,7 +125,7 @@ class GcsClientImpl implements GcsClient {
       throws IOException {
     Storage customStorageToClose = null;
     try {
-      BlobWriteOption[] options = generateWriteOptions(writeOptions, blobInfo);
+      BlobWriteOption[] sdkWriteOptions = generateWriteOptions(writeOptions, blobInfo);
       BlobWriteSessionConfig sessionConfig = generateSessionConfig(writeOptions);
       Storage clientStorage = this.storage;
       if (!sessionConfig.equals(BlobWriteSessionConfigs.getDefault())) {
@@ -136,17 +136,11 @@ class GcsClientImpl implements GcsClient {
                 .getService();
         clientStorage = customStorageToClose;
       }
-      BlobWriteSession writeSession = clientStorage.blobWriteSession(blobInfo, options);
+      BlobWriteSession writeSession = clientStorage.blobWriteSession(blobInfo, sdkWriteOptions);
       return new GcsWriteChannel(
           writeSession.open(), blobInfo, writeOptions, this.telemetry, customStorageToClose);
     } catch (StorageException e) {
-      if (customStorageToClose != null) {
-        try {
-          customStorageToClose.close();
-        } catch (Exception ex) {
-          LOG.warn("Failed to close temporary storage client on initialization failure", ex);
-        }
-      }
+      tryAndCloseCustomStorage(customStorageToClose);
       LOG.error(
           "Failed to initialize BlobWriteSession for object: gs://{}/{}",
           blobInfo.getBucket(),
@@ -193,13 +187,7 @@ class GcsClientImpl implements GcsClient {
       }
       throw new IOException("Failed to initialize BlobWriteSession for " + blobInfo.getBlobId(), e);
     } catch (Exception e) {
-      if (customStorageToClose != null) {
-        try {
-          customStorageToClose.close();
-        } catch (Exception ex) {
-          LOG.warn("Failed to close temporary storage client on initialization failure", ex);
-        }
-      }
+      tryAndCloseCustomStorage(customStorageToClose);
       if (e instanceof IOException) {
         throw (IOException) e;
       }
@@ -229,35 +217,45 @@ class GcsClientImpl implements GcsClient {
                     writeOptions.getPcuPartFileNamePrefix()));
 
       case WRITE_TO_DISK_THEN_UPLOAD:
-        if (!writeOptions.getTemporaryPaths().isEmpty()) {
-          List<Path> paths = new ArrayList<>();
-          for (String pathStr : writeOptions.getTemporaryPaths()) {
-            paths.add(Paths.get(pathStr));
-          }
-          return BlobWriteSessionConfigs.bufferToDiskThenUpload(paths);
-        } else {
-          return BlobWriteSessionConfigs.bufferToTempDirThenUpload();
-        }
+        return getWriteToDiskSessionConfig(writeOptions);
 
       case JOURNALING:
-        if (this.storage.getOptions() instanceof HttpStorageOptions) {
-          throw new UnsupportedOperationException(
-              "JOURNALING upload type is not supported because it requires the gRPC transport backend (HTTP transport is currently active).");
-        }
-        if (writeOptions.getTemporaryPaths().isEmpty()) {
-          throw new IllegalArgumentException(
-              "Temporary paths must be configured for JOURNALING upload type");
-        }
-        List<Path> paths = new ArrayList<>();
-        for (String pathStr : writeOptions.getTemporaryPaths()) {
-          paths.add(Paths.get(pathStr));
-        }
-        return BlobWriteSessionConfigs.journaling(paths);
+        return getJournalingSessionConfig(writeOptions);
 
       case CHUNK_UPLOAD:
       default:
         return BlobWriteSessionConfigs.getDefault();
     }
+  }
+
+  private BlobWriteSessionConfig getWriteToDiskSessionConfig(GcsWriteOptions writeOptions)
+      throws IOException {
+    if (!writeOptions.getTemporaryPaths().isEmpty()) {
+      List<Path> paths = new ArrayList<>();
+      for (String pathStr : writeOptions.getTemporaryPaths()) {
+        paths.add(Paths.get(pathStr));
+      }
+      return BlobWriteSessionConfigs.bufferToDiskThenUpload(paths);
+    } else {
+      return BlobWriteSessionConfigs.bufferToTempDirThenUpload();
+    }
+  }
+
+  private BlobWriteSessionConfig getJournalingSessionConfig(GcsWriteOptions writeOptions)
+      throws IOException {
+    if (this.storage.getOptions() instanceof HttpStorageOptions) {
+      throw new UnsupportedOperationException(
+          "JOURNALING upload type is not supported because it requires the gRPC transport backend (HTTP transport is currently active).");
+    }
+    if (writeOptions.getTemporaryPaths().isEmpty()) {
+      throw new IllegalArgumentException(
+          "Temporary paths must be configured for JOURNALING upload type");
+    }
+    List<Path> paths = new ArrayList<>();
+    for (String pathStr : writeOptions.getTemporaryPaths()) {
+      paths.add(Paths.get(pathStr));
+    }
+    return BlobWriteSessionConfigs.journaling(paths);
   }
 
   private ParallelCompositeUploadBlobWriteSessionConfig.PartCleanupStrategy getSdkCleanupStrategy(
@@ -273,35 +271,45 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
+  private void tryAndCloseCustomStorage(Storage customStorage) {
+    if (customStorage != null) {
+      try {
+        customStorage.close();
+      } catch (Exception e) {
+        LOG.warn("Failed to close temporary storage client on initialization failure", e);
+      }
+    }
+  }
+
   private BlobWriteOption[] generateWriteOptions(GcsWriteOptions writeOptions, BlobInfo blobInfo) {
-    List<BlobWriteOption> options = new ArrayList<>();
+    List<BlobWriteOption> sdkWriteOptions = new ArrayList<>();
 
     if (writeOptions != null) {
       if (writeOptions.isDisableGzipContent()) {
-        options.add(BlobWriteOption.disableGzipContent());
+        sdkWriteOptions.add(BlobWriteOption.disableGzipContent());
       }
       if (writeOptions.isChecksumValidationEnabled()) {
-        options.add(BlobWriteOption.crc32cMatch());
+        sdkWriteOptions.add(BlobWriteOption.crc32cMatch());
       }
       if (writeOptions.getKmsKeyName() != null) {
-        options.add(BlobWriteOption.kmsKeyName(writeOptions.getKmsKeyName()));
+        sdkWriteOptions.add(BlobWriteOption.kmsKeyName(writeOptions.getKmsKeyName()));
       }
       if (writeOptions.getEncryptionKey() != null) {
-        options.add(BlobWriteOption.encryptionKey(writeOptions.getEncryptionKey()));
+        sdkWriteOptions.add(BlobWriteOption.encryptionKey(writeOptions.getEncryptionKey()));
       }
       if (writeOptions.getUserProject() != null) {
-        options.add(BlobWriteOption.userProject(writeOptions.getUserProject()));
+        sdkWriteOptions.add(BlobWriteOption.userProject(writeOptions.getUserProject()));
       }
     }
 
     // Determine overwrite semantics based on exact generation ID or 'doesNotExist' flag
     if (blobInfo.getBlobId().getGeneration() != null) {
-      options.add(BlobWriteOption.generationMatch());
+      sdkWriteOptions.add(BlobWriteOption.generationMatch());
     } else if (writeOptions != null && !writeOptions.isOverwriteExisting()) {
-      options.add(BlobWriteOption.doesNotExist());
+      sdkWriteOptions.add(BlobWriteOption.doesNotExist());
     }
 
-    return options.toArray(new BlobWriteOption[0]);
+    return sdkWriteOptions.toArray(new BlobWriteOption[0]);
   }
 
   @Override
