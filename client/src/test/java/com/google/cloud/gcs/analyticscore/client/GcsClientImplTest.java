@@ -237,7 +237,7 @@ class GcsClientImplTest {
   }
 
   @Test
-  void getUserAgent_noOptionalUserAgent() {
+  void getUserAgent_noOptionalUserAgent() throws Exception {
     GcsClientImpl client =
         new GcsClientImpl(TEST_GCS_CLIENT_OPTIONS, executorServiceSupplier, telemetry);
     String userAgent = client.getUserAgent();
@@ -245,7 +245,7 @@ class GcsClientImplTest {
   }
 
   @Test
-  void getUserAgent_withOptionalUserAgent() {
+  void getUserAgent_withOptionalUserAgent() throws Exception {
     GcsClientOptions options =
         GcsClientOptions.builder()
             .setProjectId("test-project")
@@ -479,7 +479,7 @@ class GcsClientImplTest {
   }
 
   @Test
-  void createStorage_withParallelCompositeUpload_setsPCUSessionConfig() {
+  void createStorage_withParallelCompositeUpload_setsPCUSessionConfig() throws Exception {
     GcsWriteOptions writeOptions =
         GcsWriteOptions.builder()
             .setUploadType(GcsWriteOptions.UploadType.PARALLEL_COMPOSITE_UPLOAD)
@@ -501,7 +501,7 @@ class GcsClientImplTest {
   }
 
   @Test
-  void createStorage_withWriteToDiskThenUpload_setsBufferToDiskSessionConfig() {
+  void createStorage_withWriteToDiskThenUpload_setsBufferToDiskSessionConfig() throws Exception {
     GcsWriteOptions writeOptions =
         GcsWriteOptions.builder()
             .setUploadType(GcsWriteOptions.UploadType.WRITE_TO_DISK_THEN_UPLOAD)
@@ -615,7 +615,7 @@ class GcsClientImplTest {
   }
 
   @Test
-  void getGcsItemInfo_bucketItemId_throwsUnsupportedOperationException() {
+  void getGcsItemInfo_bucketItemId_throwsUnsupportedOperationException() throws Exception {
     GcsItemId bucketItemId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
     GcsClientImpl client =
         new GcsClientImpl(TEST_GCS_CLIENT_OPTIONS, executorServiceSupplier, telemetry);
@@ -639,7 +639,8 @@ class GcsClientImplTest {
   }
 
   @Test
-  void createStorage_withWriteToDiskNoTempPaths_setsBufferToTempDirSessionConfig() {
+  void createStorage_withWriteToDiskNoTempPaths_setsBufferToTempDirSessionConfig()
+      throws Exception {
     GcsWriteOptions writeOptions =
         GcsWriteOptions.builder()
             .setUploadType(GcsWriteOptions.UploadType.WRITE_TO_DISK_THEN_UPLOAD)

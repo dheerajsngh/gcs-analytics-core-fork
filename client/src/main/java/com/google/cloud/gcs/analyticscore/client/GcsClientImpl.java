@@ -41,7 +41,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
@@ -69,14 +68,16 @@ class GcsClientImpl implements GcsClient {
       Credentials credentials,
       GcsClientOptions clientOptions,
       Supplier<ExecutorService> executorServiceSupplier,
-      Telemetry telemetry) {
+      Telemetry telemetry)
+      throws IOException {
     this(Optional.of(credentials), clientOptions, executorServiceSupplier, telemetry);
   }
 
   GcsClientImpl(
       GcsClientOptions clientOptions,
       Supplier<ExecutorService> executorServiceSupplier,
-      Telemetry telemetry) {
+      Telemetry telemetry)
+      throws IOException {
     this(Optional.empty(), clientOptions, executorServiceSupplier, telemetry);
   }
 
@@ -84,7 +85,8 @@ class GcsClientImpl implements GcsClient {
       Optional<Credentials> credentials,
       GcsClientOptions clientOptions,
       Supplier<ExecutorService> executorServiceSupplier,
-      Telemetry telemetry) {
+      Telemetry telemetry)
+      throws IOException {
     this.clientOptions = clientOptions;
     this.executorServiceSupplier = executorServiceSupplier;
     this.telemetry = telemetry;
@@ -309,7 +311,7 @@ class GcsClientImpl implements GcsClient {
   }
 
   @VisibleForTesting
-  protected Storage createStorage(Optional<Credentials> credentials) {
+  protected Storage createStorage(Optional<Credentials> credentials) throws IOException {
     StorageOptions.Builder builder = StorageOptions.newBuilder();
     String userAgent = getUserAgent();
     builder.setHeaderProvider(FixedHeaderProvider.create(ImmutableMap.of("User-Agent", userAgent)));
@@ -318,12 +320,8 @@ class GcsClientImpl implements GcsClient {
     clientOptions.getServiceHost().ifPresent(builder::setHost);
     credentials.ifPresent(builder::setCredentials);
 
-    try {
-      builder.setBlobWriteSessionConfig(
-          generateSessionConfig(clientOptions.getGcsWriteOptions(), builder.build()));
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to initialize BlobWriteSessionConfig", e);
-    }
+    builder.setBlobWriteSessionConfig(
+        generateSessionConfig(clientOptions.getGcsWriteOptions(), builder.build()));
 
     return builder.build().getService();
   }

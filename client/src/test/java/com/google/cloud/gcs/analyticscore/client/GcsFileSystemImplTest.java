@@ -83,7 +83,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void constructor_withCredentials_createsClientWithProvidedCredentials() {
+  void constructor_withCredentials_createsClientWithProvidedCredentials() throws Exception {
     try (GcsFileSystemImpl gcsFileSystem =
         new GcsFileSystemImpl(NoCredentials.getInstance(), TEST_GCS_FILESYSTEM_OPTIONS)) {
       GcsClientImpl gcsClientImpl = (GcsClientImpl) gcsFileSystem.getGcsClient();
@@ -94,7 +94,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void constructor_withFileSystemOptions_createsClientWithDefaultCredentials() {
+  void constructor_withFileSystemOptions_createsClientWithDefaultCredentials() throws Exception {
     GcsClientOptions clientOptions =
         GcsClientOptions.builder().setProjectId("test-project-default").build();
     GcsFileSystemOptions fileSystemOptions =
@@ -110,7 +110,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void constructor_shouldInitializeAndPassMemorizedExecutorServiceToGcsClient() {
+  void constructor_shouldInitializeAndPassMemorizedExecutorServiceToGcsClient() throws Exception {
     final AtomicReference<Supplier<ExecutorService>> capturedSupplier = new AtomicReference<>();
     try (MockedConstruction<GcsClientImpl> mockGcsClientConstruction =
         Mockito.mockConstruction(
@@ -390,7 +390,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void initializeTelemetry_registerListenersToTelemetry() {
+  void initializeTelemetry_registerListenersToTelemetry() throws Exception {
     OperationListener mockListener = mock(OperationListener.class);
     CustomTelemetryOptions customTelemetryOptions =
         CustomTelemetryOptions.builder()
@@ -410,7 +410,8 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void initializeTelemetry_withLoggingTelemetryOptionsEnabled_registersLoggingTelemetryReporter() {
+  void initializeTelemetry_withLoggingTelemetryOptionsEnabled_registersLoggingTelemetryReporter()
+      throws Exception {
     LoggingTelemetryOptions loggingOptions =
         LoggingTelemetryOptions.builder().setEnabled(true).build();
     TelemetryOptions telemetryOptions =
@@ -433,7 +434,8 @@ class GcsFileSystemImplTest {
 
   @Test
   void
-      initializeTelemetry_withLoggingTelemetryOptionsDisabled_doesNotRegisterLoggingTelemetryReporter() {
+      initializeTelemetry_withLoggingTelemetryOptionsDisabled_doesNotRegisterLoggingTelemetryReporter()
+          throws Exception {
     LoggingTelemetryOptions loggingOptions =
         LoggingTelemetryOptions.builder().setEnabled(false).build();
     TelemetryOptions telemetryOptions =
@@ -450,7 +452,8 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void initializeTelemetry_withOpenTelemetryOptionsEnabled_registersOpenTelemetryReporter() {
+  void initializeTelemetry_withOpenTelemetryOptionsEnabled_registersOpenTelemetryReporter()
+      throws Exception {
     OpenTelemetryOptions openTelemetryOptions =
         OpenTelemetryOptions.builder().setEnabled(true).build();
     TelemetryOptions telemetryOptions =
@@ -471,7 +474,8 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void initializeTelemetry_withOpenTelemetryOptionsDisabled_doesNotRegisterOpenTelemetryReporter() {
+  void initializeTelemetry_withOpenTelemetryOptionsDisabled_doesNotRegisterOpenTelemetryReporter()
+      throws Exception {
     OpenTelemetryOptions openTelemetryOptions =
         OpenTelemetryOptions.builder().setEnabled(false).build();
     TelemetryOptions telemetryOptions =
@@ -488,7 +492,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void close_removesRegisteredOpenTelemetryReporters() {
+  void close_removesRegisteredOpenTelemetryReporters() throws Exception {
     OpenTelemetryOptions openTelemetryOptions =
         OpenTelemetryOptions.builder().setEnabled(true).build();
     TelemetryOptions telemetryOptions =
@@ -509,7 +513,7 @@ class GcsFileSystemImplTest {
   }
 
   @Test
-  void close_removesRegisteredLoggingTelemetryReporters() {
+  void close_removesRegisteredLoggingTelemetryReporters() throws Exception {
     LoggingTelemetryOptions loggingOptions =
         LoggingTelemetryOptions.builder().setEnabled(true).build();
     TelemetryOptions telemetryOptions =

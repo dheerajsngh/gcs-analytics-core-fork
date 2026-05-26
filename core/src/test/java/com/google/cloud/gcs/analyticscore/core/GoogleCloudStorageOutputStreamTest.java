@@ -55,7 +55,7 @@ class GoogleCloudStorageOutputStreamTest {
   private GcsItemId itemId;
 
   @BeforeEach
-  void setUp() {
+  void setUp() throws Exception {
     GcsFileSystemOptions options =
         GcsFileSystemOptions.builder()
             .setGcsClientOptions(GcsClientOptions.builder().setProjectId(TEST_PROJECT).build())
