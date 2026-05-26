@@ -16,8 +16,11 @@
 
 package com.google.cloud.gcs.analyticscore.client;
 
+import com.google.auto.value.AutoValue;
 import com.google.common.collect.ImmutableSet;
 import java.util.Collection;
+import java.util.Map;
+import java.util.Optional;
 
 /**
  * Configuration options for writing objects to Google Cloud Storage.
@@ -27,7 +30,22 @@ import java.util.Collection;
  * integrating analytics framework or compute engine can leverage the exact same underlying upload
  * strategies and performance optimizations.
  */
-public class GcsWriteOptions {
+@AutoValue
+public abstract class GcsWriteOptions {
+
+  private static final String CHECKSUM_VALIDATION_KEY = "write.checksum-validation.enabled";
+  private static final String DISABLE_GZIP_CONTENT_KEY = "write.disable-gzip-content";
+  private static final String OVERWRITE_EXISTING_KEY = "write.overwrite-existing";
+  private static final String UPLOAD_CHUNK_SIZE_KEY = "write.upload.chunk-size-bytes";
+  private static final String UPLOAD_TYPE_KEY = "write.upload.type";
+  private static final String PCU_BUFFER_COUNT_KEY = "write.pcu.buffer.count";
+  private static final String PCU_BUFFER_CAPACITY_KEY = "write.pcu.buffer.capacity-bytes";
+  private static final String PCU_PART_FILE_CLEANUP_TYPE_KEY = "write.pcu.part-file-cleanup-type";
+  private static final String PCU_PART_FILE_NAME_PREFIX_KEY = "write.pcu.part-file-name-prefix";
+  private static final String TEMPORARY_PATHS_KEY = "write.temporary-paths";
+  private static final String KMS_KEY_NAME_KEY = "write.kms-key-name";
+  private static final String USER_PROJECT_KEY = "write.user-project";
+  private static final String ENCRYPTION_KEY_KEY = "write.encryption-key";
 
   /**
    * Upload strategies matching the configurations offered by the google-cloud-storage Java client.
@@ -46,180 +64,148 @@ public class GcsWriteOptions {
     ON_SUCCESS
   }
 
-  private final boolean checksumValidationEnabled;
-  private final boolean disableGzipContent;
-  private final boolean overwriteExisting;
-  private final int uploadChunkSize;
-  private final UploadType uploadType;
-  // Metadata/Auth Configurations
-  private final String kmsKeyName;
-  private final String userProject;
-  private final String encryptionKey;
+  public abstract boolean isChecksumValidationEnabled();
+
+  public abstract boolean isDisableGzipContent();
+
+  public abstract boolean isOverwriteExisting();
+
+  public abstract int getUploadChunkSize();
+
+  public abstract UploadType getUploadType();
 
   // PCU Configurations (Active only if uploadType == PARALLEL_COMPOSITE_UPLOAD)
-  private final int pcuBufferCount;
-  private final int pcuBufferCapacity;
-  private final PartFileCleanupType pcuPartFileCleanupType;
-  private final String pcuPartFileNamePrefix;
+  public abstract int getPcuBufferCount();
+
+  public abstract int getPcuBufferCapacity();
+
+  public abstract PartFileCleanupType getPcuPartFileCleanupType();
+
+  public abstract String getPcuPartFileNamePrefix();
 
   // Disk Buffering Configurations (Active only if uploadType == WRITE_TO_DISK_THEN_UPLOAD or
   // JOURNALING)
-  private final ImmutableSet<String> temporaryPaths;
+  public abstract ImmutableSet<String> getTemporaryPaths();
 
-  private GcsWriteOptions(Builder builder) {
-    this.checksumValidationEnabled = builder.checksumValidationEnabled;
-    this.disableGzipContent = builder.disableGzipContent;
-    this.overwriteExisting = builder.overwriteExisting;
-    this.uploadChunkSize = builder.uploadChunkSize;
-    this.uploadType = builder.uploadType;
-    this.kmsKeyName = builder.kmsKeyName;
-    this.userProject = builder.userProject;
-    this.encryptionKey = builder.encryptionKey;
-    this.pcuBufferCount = builder.pcuBufferCount;
-    this.pcuBufferCapacity = builder.pcuBufferCapacity;
-    this.pcuPartFileCleanupType = builder.pcuPartFileCleanupType;
-    this.pcuPartFileNamePrefix = builder.pcuPartFileNamePrefix;
-    this.temporaryPaths = builder.temporaryPaths;
-  }
+  // Metadata/Auth Configurations
+  public abstract Optional<String> getKmsKeyName();
 
-  public boolean isChecksumValidationEnabled() {
-    return checksumValidationEnabled;
-  }
+  public abstract Optional<String> getUserProject();
 
-  public boolean isDisableGzipContent() {
-    return disableGzipContent;
-  }
+  public abstract Optional<String> getEncryptionKey();
 
-  public boolean isOverwriteExisting() {
-    return overwriteExisting;
-  }
+  public abstract Builder toBuilder();
 
-  public int getUploadChunkSize() {
-    return uploadChunkSize;
-  }
-
-  public UploadType getUploadType() {
-    return uploadType;
-  }
-
-  public int getPcuBufferCount() {
-    return pcuBufferCount;
-  }
-
-  public int getPcuBufferCapacity() {
-    return pcuBufferCapacity;
-  }
-
-  public PartFileCleanupType getPcuPartFileCleanupType() {
-    return pcuPartFileCleanupType;
-  }
-
-  public String getPcuPartFileNamePrefix() {
-    return pcuPartFileNamePrefix;
-  }
-
-  public ImmutableSet<String> getTemporaryPaths() {
-    return temporaryPaths;
-  }
-
-  public String getKmsKeyName() {
-    return kmsKeyName;
-  }
-
-  public String getUserProject() {
-    return userProject;
-  }
-
-  public String getEncryptionKey() {
-    return encryptionKey;
+  public static GcsWriteOptions createFromOptions(
+      Map<String, String> analyticsCoreOptions, String prefix) {
+    Builder optionsBuilder = builder();
+    if (analyticsCoreOptions.containsKey(prefix + CHECKSUM_VALIDATION_KEY)) {
+      optionsBuilder.setChecksumValidationEnabled(
+          Boolean.parseBoolean(analyticsCoreOptions.get(prefix + CHECKSUM_VALIDATION_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + DISABLE_GZIP_CONTENT_KEY)) {
+      optionsBuilder.setDisableGzipContent(
+          Boolean.parseBoolean(analyticsCoreOptions.get(prefix + DISABLE_GZIP_CONTENT_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + OVERWRITE_EXISTING_KEY)) {
+      optionsBuilder.setOverwriteExisting(
+          Boolean.parseBoolean(analyticsCoreOptions.get(prefix + OVERWRITE_EXISTING_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + UPLOAD_CHUNK_SIZE_KEY)) {
+      optionsBuilder.setUploadChunkSize(
+          Integer.parseInt(analyticsCoreOptions.get(prefix + UPLOAD_CHUNK_SIZE_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + UPLOAD_TYPE_KEY)) {
+      optionsBuilder.setUploadType(
+          UploadType.valueOf(analyticsCoreOptions.get(prefix + UPLOAD_TYPE_KEY).toUpperCase()));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + PCU_BUFFER_COUNT_KEY)) {
+      optionsBuilder.setPcuBufferCount(
+          Integer.parseInt(analyticsCoreOptions.get(prefix + PCU_BUFFER_COUNT_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + PCU_BUFFER_CAPACITY_KEY)) {
+      optionsBuilder.setPcuBufferCapacity(
+          Integer.parseInt(analyticsCoreOptions.get(prefix + PCU_BUFFER_CAPACITY_KEY)));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + PCU_PART_FILE_CLEANUP_TYPE_KEY)) {
+      optionsBuilder.setPcuPartFileCleanupType(
+          PartFileCleanupType.valueOf(
+              analyticsCoreOptions.get(prefix + PCU_PART_FILE_CLEANUP_TYPE_KEY).toUpperCase()));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + PCU_PART_FILE_NAME_PREFIX_KEY)) {
+      optionsBuilder.setPcuPartFileNamePrefix(
+          analyticsCoreOptions.get(prefix + PCU_PART_FILE_NAME_PREFIX_KEY));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + TEMPORARY_PATHS_KEY)) {
+      String pathsStr = analyticsCoreOptions.get(prefix + TEMPORARY_PATHS_KEY);
+      if (!pathsStr.trim().isEmpty()) {
+        optionsBuilder.setTemporaryPaths(
+            java.util.Arrays.stream(pathsStr.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(java.util.stream.Collectors.toList()));
+      }
+    }
+    if (analyticsCoreOptions.containsKey(prefix + KMS_KEY_NAME_KEY)) {
+      optionsBuilder.setKmsKeyName(analyticsCoreOptions.get(prefix + KMS_KEY_NAME_KEY));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + USER_PROJECT_KEY)) {
+      optionsBuilder.setUserProject(analyticsCoreOptions.get(prefix + USER_PROJECT_KEY));
+    }
+    if (analyticsCoreOptions.containsKey(prefix + ENCRYPTION_KEY_KEY)) {
+      optionsBuilder.setEncryptionKey(analyticsCoreOptions.get(prefix + ENCRYPTION_KEY_KEY));
+    }
+    return optionsBuilder.build();
   }
 
   public static Builder builder() {
-    return new Builder();
+    return new AutoValue_GcsWriteOptions.Builder()
+        .setChecksumValidationEnabled(false)
+        .setDisableGzipContent(true)
+        .setOverwriteExisting(true)
+        .setUploadChunkSize(24 * 1024 * 1024) // 24MB default
+        .setUploadType(UploadType.CHUNK_UPLOAD)
+        .setPcuBufferCount(1)
+        .setPcuBufferCapacity(32 * 1024 * 1024) // 32MB default
+        .setPcuPartFileCleanupType(PartFileCleanupType.ALWAYS)
+        .setPcuPartFileNamePrefix("")
+        .setTemporaryPaths(ImmutableSet.of());
   }
 
-  public static class Builder {
-    private boolean checksumValidationEnabled = false;
-    private boolean disableGzipContent = true;
-    private boolean overwriteExisting = true;
-    private int uploadChunkSize = 24 * 1024 * 1024; // 24MB default
-    private UploadType uploadType = UploadType.CHUNK_UPLOAD;
-    private int pcuBufferCount = 1;
-    private int pcuBufferCapacity = 32 * 1024 * 1024; // 32MB default
-    private PartFileCleanupType pcuPartFileCleanupType = PartFileCleanupType.ALWAYS;
-    private String pcuPartFileNamePrefix = "";
-    private ImmutableSet<String> temporaryPaths = ImmutableSet.of();
-    private String kmsKeyName = null;
-    private String userProject = null;
-    private String encryptionKey = null;
+  /** Builder for {@link GcsWriteOptions}. */
+  @AutoValue.Builder
+  public abstract static class Builder {
 
-    public Builder setChecksumValidationEnabled(boolean enabled) {
-      this.checksumValidationEnabled = enabled;
-      return this;
-    }
+    public abstract Builder setChecksumValidationEnabled(boolean enabled);
 
-    public Builder setDisableGzipContent(boolean disable) {
-      this.disableGzipContent = disable;
-      return this;
-    }
+    public abstract Builder setDisableGzipContent(boolean disable);
 
-    public Builder setOverwriteExisting(boolean overwrite) {
-      this.overwriteExisting = overwrite;
-      return this;
-    }
+    public abstract Builder setOverwriteExisting(boolean overwrite);
 
-    public Builder setUploadChunkSize(int size) {
-      this.uploadChunkSize = size;
-      return this;
-    }
+    public abstract Builder setUploadChunkSize(int size);
 
-    public Builder setUploadType(UploadType type) {
-      this.uploadType = type;
-      return this;
-    }
+    public abstract Builder setUploadType(UploadType type);
 
-    public Builder setPcuBufferCount(int count) {
-      this.pcuBufferCount = count;
-      return this;
-    }
+    public abstract Builder setPcuBufferCount(int count);
 
-    public Builder setPcuBufferCapacity(int capacity) {
-      this.pcuBufferCapacity = capacity;
-      return this;
-    }
+    public abstract Builder setPcuBufferCapacity(int capacity);
 
-    public Builder setPcuPartFileCleanupType(PartFileCleanupType cleanupType) {
-      this.pcuPartFileCleanupType = cleanupType;
-      return this;
-    }
+    public abstract Builder setPcuPartFileCleanupType(PartFileCleanupType cleanupType);
 
-    public Builder setPcuPartFileNamePrefix(String prefix) {
-      this.pcuPartFileNamePrefix = prefix;
-      return this;
-    }
+    public abstract Builder setPcuPartFileNamePrefix(String prefix);
+
+    public abstract Builder setTemporaryPaths(ImmutableSet<String> paths);
 
     public Builder setTemporaryPaths(Collection<String> paths) {
-      this.temporaryPaths = ImmutableSet.copyOf(paths);
-      return this;
+      return setTemporaryPaths(ImmutableSet.copyOf(paths));
     }
 
-    public Builder setKmsKeyName(String key) {
-      this.kmsKeyName = key;
-      return this;
-    }
+    public abstract Builder setKmsKeyName(String key);
 
-    public Builder setUserProject(String project) {
-      this.userProject = project;
-      return this;
-    }
+    public abstract Builder setUserProject(String project);
 
-    public Builder setEncryptionKey(String key) {
-      this.encryptionKey = key;
-      return this;
-    }
+    public abstract Builder setEncryptionKey(String key);
 
-    public GcsWriteOptions build() {
-      return new GcsWriteOptions(this);
-    }
+    public abstract GcsWriteOptions build();
   }
 }

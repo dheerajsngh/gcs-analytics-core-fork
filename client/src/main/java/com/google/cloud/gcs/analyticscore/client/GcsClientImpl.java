@@ -41,6 +41,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
@@ -123,24 +124,11 @@ class GcsClientImpl implements GcsClient {
   @Override
   public WritableByteChannel create(BlobInfo blobInfo, GcsWriteOptions writeOptions)
       throws IOException {
-    Storage customStorageToClose = null;
     try {
       BlobWriteOption[] sdkWriteOptions = generateWriteOptions(writeOptions, blobInfo);
-      BlobWriteSessionConfig sessionConfig = generateSessionConfig(writeOptions);
-      Storage clientStorage = this.storage;
-      if (!sessionConfig.equals(BlobWriteSessionConfigs.getDefault())) {
-        customStorageToClose =
-            this.storage.getOptions().toBuilder()
-                .setBlobWriteSessionConfig(sessionConfig)
-                .build()
-                .getService();
-        clientStorage = customStorageToClose;
-      }
-      BlobWriteSession writeSession = clientStorage.blobWriteSession(blobInfo, sdkWriteOptions);
-      return new GcsWriteChannel(
-          writeSession.open(), blobInfo, writeOptions, this.telemetry, customStorageToClose);
+      BlobWriteSession sdkWriteSession = this.storage.blobWriteSession(blobInfo, sdkWriteOptions);
+      return new GcsWriteChannel(sdkWriteSession.open(), blobInfo, writeOptions, this.telemetry);
     } catch (StorageException e) {
-      tryAndCloseCustomStorage(customStorageToClose);
       LOG.error(
           "Failed to initialize BlobWriteSession for object: gs://{}/{}",
           blobInfo.getBucket(),
@@ -187,7 +175,6 @@ class GcsClientImpl implements GcsClient {
       }
       throw new IOException("Failed to initialize BlobWriteSession for " + blobInfo.getBlobId(), e);
     } catch (Exception e) {
-      tryAndCloseCustomStorage(customStorageToClose);
       if (e instanceof IOException) {
         throw (IOException) e;
       }
@@ -198,8 +185,8 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
-  private BlobWriteSessionConfig generateSessionConfig(GcsWriteOptions writeOptions)
-      throws IOException {
+  private BlobWriteSessionConfig generateSessionConfig(
+      GcsWriteOptions writeOptions, StorageOptions storageOptions) throws IOException {
     if (writeOptions == null) {
       return BlobWriteSessionConfigs.getDefault();
     }
@@ -220,7 +207,7 @@ class GcsClientImpl implements GcsClient {
         return getWriteToDiskSessionConfig(writeOptions);
 
       case JOURNALING:
-        return getJournalingSessionConfig(writeOptions);
+        return getJournalingSessionConfig(writeOptions, storageOptions);
 
       case CHUNK_UPLOAD:
       default:
@@ -241,9 +228,9 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
-  private BlobWriteSessionConfig getJournalingSessionConfig(GcsWriteOptions writeOptions)
-      throws IOException {
-    if (this.storage.getOptions() instanceof HttpStorageOptions) {
+  private BlobWriteSessionConfig getJournalingSessionConfig(
+      GcsWriteOptions writeOptions, StorageOptions storageOptions) throws IOException {
+    if (storageOptions instanceof HttpStorageOptions) {
       throw new UnsupportedOperationException(
           "JOURNALING upload type is not supported because it requires the gRPC transport backend (HTTP transport is currently active).");
     }
@@ -271,16 +258,6 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
-  private void tryAndCloseCustomStorage(Storage customStorage) {
-    if (customStorage != null) {
-      try {
-        customStorage.close();
-      } catch (Exception e) {
-        LOG.warn("Failed to close temporary storage client on initialization failure", e);
-      }
-    }
-  }
-
   private BlobWriteOption[] generateWriteOptions(GcsWriteOptions writeOptions, BlobInfo blobInfo) {
     List<BlobWriteOption> sdkWriteOptions = new ArrayList<>();
 
@@ -291,14 +268,14 @@ class GcsClientImpl implements GcsClient {
       if (writeOptions.isChecksumValidationEnabled()) {
         sdkWriteOptions.add(BlobWriteOption.crc32cMatch());
       }
-      if (writeOptions.getKmsKeyName() != null) {
-        sdkWriteOptions.add(BlobWriteOption.kmsKeyName(writeOptions.getKmsKeyName()));
+      if (writeOptions.getKmsKeyName().isPresent()) {
+        sdkWriteOptions.add(BlobWriteOption.kmsKeyName(writeOptions.getKmsKeyName().get()));
       }
-      if (writeOptions.getEncryptionKey() != null) {
-        sdkWriteOptions.add(BlobWriteOption.encryptionKey(writeOptions.getEncryptionKey()));
+      if (writeOptions.getEncryptionKey().isPresent()) {
+        sdkWriteOptions.add(BlobWriteOption.encryptionKey(writeOptions.getEncryptionKey().get()));
       }
-      if (writeOptions.getUserProject() != null) {
-        sdkWriteOptions.add(BlobWriteOption.userProject(writeOptions.getUserProject()));
+      if (writeOptions.getUserProject().isPresent()) {
+        sdkWriteOptions.add(BlobWriteOption.userProject(writeOptions.getUserProject().get()));
       }
     }
 
@@ -340,6 +317,13 @@ class GcsClientImpl implements GcsClient {
     clientOptions.getClientLibToken().ifPresent(builder::setClientLibToken);
     clientOptions.getServiceHost().ifPresent(builder::setHost);
     credentials.ifPresent(builder::setCredentials);
+
+    try {
+      builder.setBlobWriteSessionConfig(
+          generateSessionConfig(clientOptions.getGcsWriteOptions(), builder.build()));
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to initialize BlobWriteSessionConfig", e);
+    }
 
     return builder.build().getService();
   }

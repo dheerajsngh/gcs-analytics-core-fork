@@ -19,6 +19,8 @@ package com.google.cloud.gcs.analyticscore.client;
 import static com.google.common.truth.Truth.assertThat;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class GcsWriteOptionsTest {
@@ -40,9 +42,9 @@ class GcsWriteOptionsTest {
     assertThat(options.getPcuPartFileNamePrefix()).isEmpty();
     // Other fields
     assertThat(options.getTemporaryPaths()).isEmpty();
-    assertThat(options.getKmsKeyName()).isNull();
-    assertThat(options.getUserProject()).isNull();
-    assertThat(options.getEncryptionKey()).isNull();
+    assertThat(options.getKmsKeyName().isPresent()).isFalse();
+    assertThat(options.getUserProject().isPresent()).isFalse();
+    assertThat(options.getEncryptionKey().isPresent()).isFalse();
   }
 
   @Test
@@ -78,8 +80,56 @@ class GcsWriteOptionsTest {
     assertThat(options.getPcuPartFileNamePrefix()).isEqualTo("temp-prefix-");
     // Other fields
     assertThat(options.getTemporaryPaths()).containsExactly("/tmp/path1", "/tmp/path2").inOrder();
-    assertThat(options.getKmsKeyName()).isEqualTo("kms-key");
-    assertThat(options.getUserProject()).isEqualTo("project-123");
-    assertThat(options.getEncryptionKey()).isEqualTo("enc-key");
+    assertThat(options.getKmsKeyName()).hasValue("kms-key");
+    assertThat(options.getUserProject()).hasValue("project-123");
+    assertThat(options.getEncryptionKey()).hasValue("enc-key");
+  }
+
+  @Test
+  void testCreateFromOptions() {
+    Map<String, String> rawOptions =
+        ImmutableMap.<String, String>builder()
+            .put("gcs.write.checksum-validation.enabled", "true")
+            .put("gcs.write.disable-gzip-content", "false")
+            .put("gcs.write.overwrite-existing", "false")
+            .put("gcs.write.upload.chunk-size-bytes", "1024")
+            .put("gcs.write.upload.type", "parallel_composite_upload")
+            .put("gcs.write.pcu.buffer.count", "4")
+            .put("gcs.write.pcu.buffer.capacity-bytes", "67108864")
+            .put("gcs.write.pcu.part-file-cleanup-type", "on_success")
+            .put("gcs.write.pcu.part-file-name-prefix", "temp-prefix-")
+            .put("gcs.write.temporary-paths", "/tmp/path1, /tmp/path2")
+            .put("gcs.write.kms-key-name", "kms-key")
+            .put("gcs.write.user-project", "project-123")
+            .put("gcs.write.encryption-key", "enc-key")
+            .build();
+
+    GcsWriteOptions options = GcsWriteOptions.createFromOptions(rawOptions, "gcs.");
+
+    assertThat(options.isChecksumValidationEnabled()).isTrue();
+    assertThat(options.isDisableGzipContent()).isFalse();
+    assertThat(options.isOverwriteExisting()).isFalse();
+    assertThat(options.getUploadChunkSize()).isEqualTo(1024);
+    assertThat(options.getUploadType())
+        .isEqualTo(GcsWriteOptions.UploadType.PARALLEL_COMPOSITE_UPLOAD);
+    assertThat(options.getPcuBufferCount()).isEqualTo(4);
+    assertThat(options.getPcuBufferCapacity()).isEqualTo(64 * 1024 * 1024);
+    assertThat(options.getPcuPartFileCleanupType())
+        .isEqualTo(GcsWriteOptions.PartFileCleanupType.ON_SUCCESS);
+    assertThat(options.getPcuPartFileNamePrefix()).isEqualTo("temp-prefix-");
+    assertThat(options.getTemporaryPaths()).containsExactly("/tmp/path1", "/tmp/path2").inOrder();
+    assertThat(options.getKmsKeyName()).hasValue("kms-key");
+    assertThat(options.getUserProject()).hasValue("project-123");
+    assertThat(options.getEncryptionKey()).hasValue("enc-key");
+  }
+
+  @Test
+  void testCreateFromOptions_withWhitespaceAndEmptyPaths() {
+    Map<String, String> rawOptions =
+        ImmutableMap.of("gcs.write.temporary-paths", "  , /tmp/path1 , , /tmp/path2 ");
+
+    GcsWriteOptions options = GcsWriteOptions.createFromOptions(rawOptions, "gcs.");
+
+    assertThat(options.getTemporaryPaths()).containsExactly("/tmp/path1", "/tmp/path2").inOrder();
   }
 }

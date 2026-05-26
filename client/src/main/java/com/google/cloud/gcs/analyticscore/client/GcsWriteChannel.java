@@ -44,33 +44,22 @@ public class GcsWriteChannel implements WritableByteChannel {
 
   private final BlobInfo blobInfo;
   private final ImmutableMap<String, String> commonAttributes;
-  private WritableByteChannel internalWriteChannel;
+  private volatile WritableByteChannel sdkWriteChannel;
   private final Telemetry telemetry;
   private final GcsWriteOptions writeOptions;
-  private final AutoCloseable resourcesToClose;
 
-  private long bytesWritten = 0;
+  private volatile long bytesWritten = 0;
   private volatile boolean closed = false;
 
   GcsWriteChannel(
-      WritableByteChannel internalWriteChannel,
+      WritableByteChannel sdkWriteChannel,
       BlobInfo blobInfo,
       GcsWriteOptions writeOptions,
       Telemetry telemetry) {
-    this(internalWriteChannel, blobInfo, writeOptions, telemetry, null);
-  }
-
-  GcsWriteChannel(
-      WritableByteChannel internalWriteChannel,
-      BlobInfo blobInfo,
-      GcsWriteOptions writeOptions,
-      Telemetry telemetry,
-      AutoCloseable resourcesToClose) {
-    this.internalWriteChannel = internalWriteChannel;
+    this.sdkWriteChannel = sdkWriteChannel;
     this.blobInfo = blobInfo;
     this.writeOptions = writeOptions;
     this.telemetry = telemetry;
-    this.resourcesToClose = resourcesToClose;
     this.commonAttributes =
         ImmutableMap.of(Attribute.CLASS_NAME.name(), GcsWriteChannel.class.getName());
 
@@ -94,7 +83,7 @@ public class GcsWriteChannel implements WritableByteChannel {
         recorder -> {
           int bytesToDraft = src.remaining();
           try {
-            int written = internalWriteChannel.write(src);
+            int written = sdkWriteChannel.write(src);
             if (written > 0) {
               bytesWritten += written;
               recorder.record(Metric.WRITE_BYTES, written, Collections.emptyMap());
@@ -132,7 +121,7 @@ public class GcsWriteChannel implements WritableByteChannel {
 
   @Override
   public boolean isOpen() {
-    return !closed && internalWriteChannel != null && internalWriteChannel.isOpen();
+    return !closed && sdkWriteChannel != null && sdkWriteChannel.isOpen();
   }
 
   @Override
@@ -152,8 +141,8 @@ public class GcsWriteChannel implements WritableByteChannel {
               bytesWritten);
           closed = true;
           try {
-            if (internalWriteChannel != null) {
-              internalWriteChannel.close();
+            if (sdkWriteChannel != null) {
+              sdkWriteChannel.close();
             }
             LOG.debug("Successfully closed and finalized object: {}", blobInfo.getBlobId());
           } catch (StorageException e) {
@@ -169,14 +158,7 @@ public class GcsWriteChannel implements WritableByteChannel {
             }
             throw e;
           } finally {
-            internalWriteChannel = null;
-            if (resourcesToClose != null) {
-              try {
-                resourcesToClose.close();
-              } catch (Exception e) {
-                LOG.warn("Failed to close resources associated with channel", e);
-              }
-            }
+            sdkWriteChannel = null;
           }
           return null;
         });
