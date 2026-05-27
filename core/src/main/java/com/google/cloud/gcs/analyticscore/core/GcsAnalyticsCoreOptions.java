@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-package com.google.cloud.gcs.analyticscore.client;
+package com.google.cloud.gcs.analyticscore.core;
 
+import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.common.collect.ImmutableMap;
 import java.util.Map;
 

@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-package com.google.cloud.gcs.analyticscore.client;
+package com.google.cloud.gcs.analyticscore.core;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.cloud.gcs.analyticscore.client.GcsClientOptions;
+import com.google.cloud.gcs.analyticscore.client.GcsFileSystemOptions;
 import com.google.common.collect.ImmutableMap;
 import org.junit.jupiter.api.Test;
 
