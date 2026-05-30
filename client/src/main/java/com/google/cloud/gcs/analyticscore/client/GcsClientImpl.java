@@ -177,14 +177,18 @@ class GcsClientImpl implements GcsClient {
       }
       throw new IOException("Failed to initialize BlobWriteSession for " + blobInfo.getBlobId(), e);
     } catch (Exception e) {
-      if (e instanceof IOException) {
-        throw (IOException) e;
-      }
-      if (e instanceof RuntimeException) {
-        throw (RuntimeException) e;
-      }
-      throw new IOException("Failed to initialize BlobWriteSession for " + blobInfo.getBlobId(), e);
+      throw propagateAsIOException(e, blobInfo);
     }
+  }
+
+  private static IOException propagateAsIOException(Exception e, BlobInfo blobInfo) {
+    if (e instanceof IOException) {
+      return (IOException) e;
+    }
+    if (e instanceof RuntimeException) {
+      throw (RuntimeException) e;
+    }
+    return new IOException("Failed to initialize BlobWriteSession for " + blobInfo.getBlobId(), e);
   }
 
   private BlobWriteSessionConfig generateSessionConfig(
@@ -195,15 +199,7 @@ class GcsClientImpl implements GcsClient {
 
     switch (writeOptions.getUploadType()) {
       case PARALLEL_COMPOSITE_UPLOAD:
-        return BlobWriteSessionConfigs.parallelCompositeUpload()
-            .withBufferAllocationStrategy(
-                ParallelCompositeUploadBlobWriteSessionConfig.BufferAllocationStrategy.fixedPool(
-                    writeOptions.getPcuBufferCount(), writeOptions.getPcuBufferCapacity()))
-            .withPartCleanupStrategy(
-                getSdkCleanupStrategy(writeOptions.getPcuPartFileCleanupType()))
-            .withPartNamingStrategy(
-                ParallelCompositeUploadBlobWriteSessionConfig.PartNamingStrategy.prefix(
-                    writeOptions.getPcuPartFileNamePrefix()));
+        return getParallelCompositeUploadSessionConfig(writeOptions);
 
       case WRITE_TO_DISK_THEN_UPLOAD:
         return getWriteToDiskSessionConfig(writeOptions);
@@ -215,6 +211,18 @@ class GcsClientImpl implements GcsClient {
       default:
         return BlobWriteSessionConfigs.getDefault();
     }
+  }
+
+  private BlobWriteSessionConfig getParallelCompositeUploadSessionConfig(
+      GcsWriteOptions writeOptions) {
+    return BlobWriteSessionConfigs.parallelCompositeUpload()
+        .withBufferAllocationStrategy(
+            ParallelCompositeUploadBlobWriteSessionConfig.BufferAllocationStrategy.fixedPool(
+                writeOptions.getPcuBufferCount(), writeOptions.getPcuBufferCapacity()))
+        .withPartCleanupStrategy(getSdkCleanupStrategy(writeOptions.getPcuPartFileCleanupType()))
+        .withPartNamingStrategy(
+            ParallelCompositeUploadBlobWriteSessionConfig.PartNamingStrategy.prefix(
+                writeOptions.getPcuPartFileNamePrefix()));
   }
 
   private BlobWriteSessionConfig getWriteToDiskSessionConfig(GcsWriteOptions writeOptions)
