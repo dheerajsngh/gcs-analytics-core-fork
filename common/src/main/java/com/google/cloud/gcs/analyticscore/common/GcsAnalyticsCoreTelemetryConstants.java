@@ -39,7 +39,16 @@ public class GcsAnalyticsCoreTelemetryConstants {
     WRITE_DURATION("gcs.analytics-core.client.write.duration", MetricType.DURATION),
     CREATE_DURATION("gcs.analytics-core.client.write.create.duration", MetricType.DURATION),
     WRITE_CLOSE_DURATION("gcs.analytics-core.client.write.close.duration", MetricType.DURATION),
-    GCS_CLIENT_CREATE_DURATION("gcs.analytics-core.client.create.duration", MetricType.DURATION);
+    GCS_CLIENT_CREATE_DURATION("gcs.analytics-core.client.create.duration", MetricType.DURATION),
+    GET_FILE_INFO_DURATION("gcs.analytics-core.client.get.file.info.duration", MetricType.DURATION),
+    LIST_FILE_INFO_DURATION(
+        "gcs.analytics-core.client.list.file.info.duration", MetricType.DURATION),
+    MKDIRS_DURATION("gcs.analytics-core.client.mkdirs.duration", MetricType.DURATION),
+    DELETE_DURATION("gcs.analytics-core.client.delete.duration", MetricType.DURATION),
+    DELETE_FOLDER_RECURSIVE_DURATION(
+        "gcs.analytics-core.client.delete.folder.recursive.duration", MetricType.DURATION),
+    RENAME_DURATION("gcs.analytics-core.client.rename.duration", MetricType.DURATION),
+    RENAME_FOLDER_DURATION("gcs.analytics-core.client.rename.folder.duration", MetricType.DURATION);
 
     private final String name;
     private final MetricType type;
@@ -71,6 +80,13 @@ public class GcsAnalyticsCoreTelemetryConstants {
     WRITE,
     CREATE,
     WRITE_CLOSE,
-    GCS_CLIENT_CREATE;
+    GCS_CLIENT_CREATE,
+    GET_FILE_INFO,
+    LIST_FILE_INFO,
+    MKDIRS,
+    DELETE,
+    DELETE_FOLDER_RECURSIVE,
+    RENAME,
+    RENAME_FOLDER;
   }
 }

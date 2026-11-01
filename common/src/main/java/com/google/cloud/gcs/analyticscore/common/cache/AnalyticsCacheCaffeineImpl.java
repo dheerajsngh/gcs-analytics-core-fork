@@ -24,6 +24,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Weigher;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * An {@link AnalyticsCache} implementation backed by a Caffeine {@link Cache}. This implementation
@@ -118,6 +119,13 @@ public class AnalyticsCacheCaffeineImpl<K, V> implements AnalyticsCache<K, V> {
   @Override
   public void invalidateAll() {
     cache.invalidateAll();
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public void invalidateIf(Predicate<? super K> predicate) {
+    checkNotNull(predicate, "predicate cannot be null");
+    cache.asMap().keySet().removeIf(predicate);
   }
 
   /** {@inheritDoc} */

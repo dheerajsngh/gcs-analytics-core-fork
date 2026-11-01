@@ -16,7 +16,10 @@
 
 package com.google.cloud.gcs.analyticscore.common.cache;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * A simple, generic interface for an in-memory cache. All implementations of this interface must be
@@ -62,6 +65,20 @@ public interface AnalyticsCache<K, V> {
 
   /** Discards all entries in the cache. */
   void invalidateAll();
+
+  /**
+   * Discards all cached entries whose keys match the given {@code predicate}.
+   *
+   * <p>The default implementation validates {@code predicate} and falls back to {@link
+   * #invalidateAll()} to preserve backward compatibility for custom implementations.
+   *
+   * @param predicate The predicate used to select keys to invalidate.
+   * @throws NullPointerException if {@code predicate} is {@code null}.
+   */
+  default void invalidateIf(Predicate<? super K> predicate) {
+    checkNotNull(predicate, "predicate cannot be null");
+    invalidateAll();
+  }
 
   /** Returns the approximate number of entries in this cache. */
   long size();

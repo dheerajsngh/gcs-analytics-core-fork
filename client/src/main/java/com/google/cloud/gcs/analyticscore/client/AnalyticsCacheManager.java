@@ -16,6 +16,7 @@
 
 package com.google.cloud.gcs.analyticscore.client;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.github.benmanes.caffeine.cache.Weigher;
@@ -24,7 +25,9 @@ import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheCaffeineImp
 import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheNoOpImpl;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * Manages the caching layer for GCS objects. This class is thread-safe and acts as a registry for
@@ -109,6 +112,77 @@ public class AnalyticsCacheManager {
   public void invalidateSmallObject(GcsItemId itemId) {
     checkNotNull(itemId, "itemId cannot be null");
     smallObjectCache.invalidate(itemId);
+  }
+
+  /**
+   * Invalidates all cached entries (across all content generations) in the footer and small-object
+   * caches matching the given {@code bucketName} and {@code objectName}. Leaves bucket properties
+   * untouched.
+   *
+   * @param bucketName The name of the GCS bucket; must be non-null and non-empty.
+   * @param objectName The name of the GCS object; must be non-null.
+   */
+  public void invalidateObject(String bucketName, String objectName) {
+    checkNotNull(bucketName, "bucketName cannot be null");
+    checkArgument(!bucketName.isEmpty(), "bucketName cannot be empty");
+    checkNotNull(objectName, "objectName cannot be null");
+
+    Optional<String> targetObjectName = Optional.of(objectName);
+    Predicate<GcsItemId> matchesObject =
+        key ->
+            key.getBucketName().equals(bucketName) && targetObjectName.equals(key.getObjectName());
+    footerCache.invalidateIf(matchesObject);
+    smallObjectCache.invalidateIf(matchesObject);
+  }
+
+  /**
+   * Invalidates all cached entries (across all content generations) in the footer and small-object
+   * caches matching the bucket and object name of {@code itemId}. Leaves bucket properties
+   * untouched.
+   *
+   * @param itemId The GCS object identifier; must represent a GCS object.
+   */
+  public void invalidateObject(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId cannot be null");
+    checkArgument(itemId.isGcsObject(), "Expected GCS object to be provided. But got: %s", itemId);
+    invalidateObject(itemId.getBucketName(), itemId.getObjectName().get());
+  }
+
+  /**
+   * Invalidates all cached entries (across all content generations) in the footer and small-object
+   * caches under the given bucket or object/directory {@code prefix}. Leaves bucket properties
+   * untouched.
+   *
+   * @param prefix The bucket or object/directory prefix to invalidate; must not be null or GCS
+   *     root.
+   */
+  public void invalidatePrefix(GcsItemId prefix) {
+    checkNotNull(prefix, "prefix cannot be null");
+    checkArgument(!prefix.isRoot(), "Cannot invalidate prefix for GCS root");
+    checkArgument(!prefix.getBucketName().isEmpty(), "prefix bucketName cannot be empty");
+
+    String bucketName = prefix.getBucketName();
+    Predicate<GcsItemId> matchesPrefix;
+    if (prefix.isBucket()) {
+      matchesPrefix = key -> key.getBucketName().equals(bucketName);
+    } else {
+      String raw = prefix.getObjectName().get();
+      String dirPrefix = raw.endsWith("/") ? raw : raw + "/";
+      String bare = raw.endsWith("/") ? raw.substring(0, raw.length() - 1) : raw;
+      matchesPrefix =
+          key -> {
+            if (!key.getBucketName().equals(bucketName) || key.getObjectName().isEmpty()) {
+              return false;
+            }
+            String obj = key.getObjectName().get();
+            return obj.equals(raw)
+                || obj.equals(dirPrefix)
+                || (!bare.isEmpty() && obj.equals(bare))
+                || obj.startsWith(dirPrefix);
+          };
+    }
+    footerCache.invalidateIf(matchesPrefix);
+    smallObjectCache.invalidateIf(matchesPrefix);
   }
 
   /**

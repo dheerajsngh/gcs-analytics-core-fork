@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -191,6 +192,55 @@ class AnalyticsCacheCaffeineImplTest {
 
     assertThat(cache.get("key1")).isEmpty();
     assertThat(cache.get("key2")).isEmpty();
+  }
+
+  @Test
+  void invalidateIf_nullPredicate_throwsNullPointerException() {
+    cache.put("key1", "value1");
+
+    NullPointerException exception =
+        assertThrows(NullPointerException.class, () -> cache.invalidateIf(null));
+
+    assertThat(exception).hasMessageThat().contains("predicate cannot be null");
+    assertThat(cache.get("key1")).hasValue("value1");
+  }
+
+  @Test
+  void invalidateIf_matchingKeys_removesOnlyMatchingEntries() {
+    cache.put("dir/a", "value1");
+    cache.put("dir/b", "value2");
+    cache.put("dir_other/c", "value3");
+
+    cache.invalidateIf(key -> key.startsWith("dir/"));
+    cache.cleanUp();
+
+    assertThat(cache.get("dir/a")).isEmpty();
+    assertThat(cache.get("dir/b")).isEmpty();
+    assertThat(cache.get("dir_other/c")).hasValue("value3");
+    assertThat(cache.size()).isEqualTo(1);
+  }
+
+  @Test
+  void invalidateIf_noMatchingKeys_retainsAllEntries() {
+    cache.put("key1", "value1");
+    cache.put("key2", "value2");
+
+    cache.invalidateIf(key -> key.startsWith("missing/"));
+
+    assertThat(cache.get("key1")).hasValue("value1");
+    assertThat(cache.get("key2")).hasValue("value2");
+  }
+
+  @Test
+  void invalidateIf_supertypePredicate_removesMatchingEntries() {
+    cache.put("ab", "short");
+    cache.put("abcdef", "long");
+    Predicate<CharSequence> longerThanThree = seq -> seq.length() > 3;
+
+    cache.invalidateIf(longerThanThree);
+
+    assertThat(cache.get("ab")).hasValue("short");
+    assertThat(cache.get("abcdef")).isEmpty();
   }
 
   @Test

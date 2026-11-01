@@ -100,6 +100,23 @@ class AnalyticsCacheNoOpImplTest {
   }
 
   @Test
+  void invalidateIf_nullPredicate_throwsNullPointerException() {
+    NullPointerException exception =
+        assertThrows(NullPointerException.class, () -> cache.invalidateIf(null));
+
+    assertThat(exception).hasMessageThat().contains("predicate cannot be null");
+  }
+
+  @Test
+  void invalidateIf_validPredicate_doesNothing() {
+    cache.put("key1", "value1");
+
+    cache.invalidateIf(key -> true);
+
+    assertThat(cache.size()).isEqualTo(0);
+  }
+
+  @Test
   void cleanUp_anyState_doesNothing() {
     cache.put("key1", "value1");
 

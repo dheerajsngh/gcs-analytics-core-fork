@@ -19,6 +19,7 @@ package com.google.cloud.gcs.analyticscore.common.cache;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * An {@link AnalyticsCache} implementation that does nothing. All lookups result in a miss, and all
@@ -78,6 +79,13 @@ public class AnalyticsCacheNoOpImpl<K, V> implements AnalyticsCache<K, V> {
   /** {@inheritDoc} */
   @Override
   public void invalidateAll() {
+    // Do nothing
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public void invalidateIf(Predicate<? super K> predicate) {
+    checkNotNull(predicate, "predicate cannot be null");
     // Do nothing
   }
 

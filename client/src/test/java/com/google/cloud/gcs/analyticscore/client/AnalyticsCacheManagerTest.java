@@ -233,4 +233,289 @@ class AnalyticsCacheManagerTest {
 
     assertThat(callCount.get()).isEqualTo(1);
   }
+
+  @Test
+  void invalidateObject_nullOrEmptyArguments_throwsExpectedException() {
+    assertThrows(NullPointerException.class, () -> manager.invalidateObject(null, "obj"));
+    assertThrows(IllegalArgumentException.class, () -> manager.invalidateObject("", "obj"));
+    assertThrows(NullPointerException.class, () -> manager.invalidateObject(BUCKET_NAME, null));
+    assertThrows(NullPointerException.class, () -> manager.invalidateObject(null));
+    assertThrows(IllegalArgumentException.class, () -> manager.invalidateObject(GcsItemId.ROOT));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> manager.invalidateObject(GcsItemId.builder().setBucketName(BUCKET_NAME).build()));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            manager.invalidateObject(
+                GcsItemId.builder().setBucketName(BUCKET_NAME).setObjectName("").build()));
+  }
+
+  @Test
+  void invalidateObject_byBucketAndObject_evictsAllGenerationsAndPreservesOtherEntries()
+      throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId targetNoGen = itemId(BUCKET_NAME, "dir/file.parquet");
+    GcsItemId targetGen1 = itemId(BUCKET_NAME, "dir/file.parquet", 101L);
+    GcsItemId targetGen2 = itemId(BUCKET_NAME, "dir/file.parquet", 202L);
+    GcsItemId siblingObj = itemId(BUCKET_NAME, "dir/other.parquet", 101L);
+    GcsItemId otherBucketObj = itemId("other-bucket", "dir/file.parquet", 101L);
+    for (GcsItemId id :
+        new GcsItemId[] {targetNoGen, targetGen1, targetGen2, siblingObj, otherBucketObj}) {
+      populateBothObjectCaches(bothCachesManager, id);
+    }
+    bothCachesManager.getBucketProperties(
+        BUCKET_NAME, name -> BucketProperties.create(true, false));
+
+    bothCachesManager.invalidateObject(BUCKET_NAME, "dir/file.parquet");
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetNoGen);
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetGen1);
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetGen2);
+    assertCachedInBothObjectCaches(bothCachesManager, siblingObj);
+    assertCachedInBothObjectCaches(bothCachesManager, otherBucketObj);
+    assertBucketPropertiesCached(bothCachesManager, BUCKET_NAME);
+  }
+
+  @Test
+  void invalidateObject_byItemIdWithGeneration_evictsAllGenerationsOfObject() throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId targetNoGen = itemId(BUCKET_NAME, "dir/file.parquet");
+    GcsItemId targetGen1 = itemId(BUCKET_NAME, "dir/file.parquet", 101L);
+    GcsItemId targetGen2 = itemId(BUCKET_NAME, "dir/file.parquet", 202L);
+    populateBothObjectCaches(bothCachesManager, targetNoGen);
+    populateBothObjectCaches(bothCachesManager, targetGen1);
+    populateBothObjectCaches(bothCachesManager, targetGen2);
+
+    bothCachesManager.invalidateObject(itemId(BUCKET_NAME, "dir/file.parquet", 999L));
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetNoGen);
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetGen1);
+    assertEvictedFromBothObjectCaches(bothCachesManager, targetGen2);
+  }
+
+  @Test
+  void invalidateObject_cachesDisabled_succeeds() {
+    AnalyticsCacheManager disabledManager =
+        new AnalyticsCacheManager(
+            GcsCacheOptions.builder()
+                .setFooterCacheEnabled(false)
+                .setSmallObjectCacheEnabled(false)
+                .build());
+
+    disabledManager.invalidateObject(ITEM_ID);
+  }
+
+  @Test
+  void invalidatePrefix_invalidPrefix_throwsExpectedException() {
+    NullPointerException nullException =
+        assertThrows(NullPointerException.class, () -> manager.invalidatePrefix(null));
+    IllegalArgumentException rootException =
+        assertThrows(
+            IllegalArgumentException.class, () -> manager.invalidatePrefix(GcsItemId.ROOT));
+    IllegalArgumentException emptyBucketException =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                manager.invalidatePrefix(
+                    GcsItemId.builder().setBucketName("").setObjectName("dir/").build()));
+
+    assertThat(nullException).hasMessageThat().contains("prefix cannot be null");
+    assertThat(rootException).hasMessageThat().contains("Cannot invalidate prefix for GCS root");
+    assertThat(emptyBucketException).hasMessageThat().contains("bucketName");
+  }
+
+  @Test
+  void invalidatePrefix_withoutTrailingSlash_evictsMatchingSubtreeAndPreservesSiblingPrefix()
+      throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId bareObject = itemId(BUCKET_NAME, "dir");
+    GcsItemId markerObject = itemId(BUCKET_NAME, "dir/");
+    GcsItemId childNoGen = itemId(BUCKET_NAME, "dir/file.parquet");
+    GcsItemId childWithGen = itemId(BUCKET_NAME, "dir/file.parquet", 42L);
+    GcsItemId nestedChild = itemId(BUCKET_NAME, "dir/sub/file2.parquet", 7L);
+    GcsItemId siblingDirChild = itemId(BUCKET_NAME, "dir_other/file.parquet", 42L);
+    GcsItemId siblingBare = itemId(BUCKET_NAME, "dir_other");
+    GcsItemId otherBucketChild = itemId("other-bucket", "dir/file.parquet");
+    for (GcsItemId id :
+        new GcsItemId[] {
+          bareObject,
+          markerObject,
+          childNoGen,
+          childWithGen,
+          nestedChild,
+          siblingDirChild,
+          siblingBare,
+          otherBucketChild
+        }) {
+      populateBothObjectCaches(bothCachesManager, id);
+    }
+    bothCachesManager.getBucketProperties(
+        BUCKET_NAME, name -> BucketProperties.create(true, false));
+
+    bothCachesManager.invalidatePrefix(itemId(BUCKET_NAME, "dir"));
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, bareObject);
+    assertEvictedFromBothObjectCaches(bothCachesManager, markerObject);
+    assertEvictedFromBothObjectCaches(bothCachesManager, childNoGen);
+    assertEvictedFromBothObjectCaches(bothCachesManager, childWithGen);
+    assertEvictedFromBothObjectCaches(bothCachesManager, nestedChild);
+    assertCachedInBothObjectCaches(bothCachesManager, siblingDirChild);
+    assertCachedInBothObjectCaches(bothCachesManager, siblingBare);
+    assertCachedInBothObjectCaches(bothCachesManager, otherBucketChild);
+    assertBucketPropertiesCached(bothCachesManager, BUCKET_NAME);
+  }
+
+  @Test
+  void invalidatePrefix_withTrailingSlash_evictsMatchingSubtreeAndPreservesSiblingPrefix()
+      throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId bareObject = itemId(BUCKET_NAME, "dir");
+    GcsItemId markerObject = itemId(BUCKET_NAME, "dir/");
+    GcsItemId child = itemId(BUCKET_NAME, "dir/file.parquet", 42L);
+    GcsItemId siblingDirChild = itemId(BUCKET_NAME, "dir_other/file.parquet", 42L);
+    for (GcsItemId id : new GcsItemId[] {bareObject, markerObject, child, siblingDirChild}) {
+      populateBothObjectCaches(bothCachesManager, id);
+    }
+    bothCachesManager.getBucketProperties(
+        BUCKET_NAME, name -> BucketProperties.create(true, false));
+
+    bothCachesManager.invalidatePrefix(itemId(BUCKET_NAME, "dir/"));
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, bareObject);
+    assertEvictedFromBothObjectCaches(bothCachesManager, markerObject);
+    assertEvictedFromBothObjectCaches(bothCachesManager, child);
+    assertCachedInBothObjectCaches(bothCachesManager, siblingDirChild);
+    assertBucketPropertiesCached(bothCachesManager, BUCKET_NAME);
+  }
+
+  @Test
+  void invalidatePrefix_slashObjectName_doesNotEvictUnprefixedBucketObjects() throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId slashObject = itemId(BUCKET_NAME, "/");
+    GcsItemId slashChild = itemId(BUCKET_NAME, "/nested.parquet");
+    GcsItemId normalObject = itemId(BUCKET_NAME, "normal.parquet");
+    populateBothObjectCaches(bothCachesManager, slashObject);
+    populateBothObjectCaches(bothCachesManager, slashChild);
+    populateBothObjectCaches(bothCachesManager, normalObject);
+
+    bothCachesManager.invalidatePrefix(itemId(BUCKET_NAME, "/"));
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, slashObject);
+    assertEvictedFromBothObjectCaches(bothCachesManager, slashChild);
+    assertCachedInBothObjectCaches(bothCachesManager, normalObject);
+  }
+
+  @Test
+  void invalidatePrefix_bucketPrefix_evictsBucketObjectsAndPreservesBucketProperties()
+      throws IOException {
+    AnalyticsCacheManager bothCachesManager = createManagerWithFooterAndSmallObjectCaches();
+    GcsItemId obj1 = itemId(BUCKET_NAME, "a/file1.parquet");
+    GcsItemId obj2 = itemId(BUCKET_NAME, "b/file2.parquet", 77L);
+    GcsItemId otherBucketObj = itemId("other-bucket", "a/file1.parquet");
+    populateBothObjectCaches(bothCachesManager, obj1);
+    populateBothObjectCaches(bothCachesManager, obj2);
+    populateBothObjectCaches(bothCachesManager, otherBucketObj);
+    bothCachesManager.getBucketProperties(
+        BUCKET_NAME, name -> BucketProperties.create(true, false));
+
+    bothCachesManager.invalidatePrefix(GcsItemId.builder().setBucketName(BUCKET_NAME).build());
+
+    assertEvictedFromBothObjectCaches(bothCachesManager, obj1);
+    assertEvictedFromBothObjectCaches(bothCachesManager, obj2);
+    assertCachedInBothObjectCaches(bothCachesManager, otherBucketObj);
+    assertBucketPropertiesCached(bothCachesManager, BUCKET_NAME);
+  }
+
+  @Test
+  void invalidatePrefix_cachesDisabled_succeeds() {
+    AnalyticsCacheManager disabledManager =
+        new AnalyticsCacheManager(
+            GcsCacheOptions.builder()
+                .setFooterCacheEnabled(false)
+                .setSmallObjectCacheEnabled(false)
+                .build());
+
+    disabledManager.invalidatePrefix(itemId(BUCKET_NAME, "dir/"));
+  }
+
+  private static AnalyticsCacheManager createManagerWithFooterAndSmallObjectCaches() {
+    return new AnalyticsCacheManager(
+        GcsCacheOptions.builder()
+            .setFooterCacheEnabled(true)
+            .setFooterCacheMaxSizeBytes(10_000)
+            .setSmallObjectCacheEnabled(true)
+            .setSmallObjectCacheMaxSizeBytes(10_000)
+            .build());
+  }
+
+  private static GcsItemId itemId(String bucketName, String objectName) {
+    return GcsItemId.builder().setBucketName(bucketName).setObjectName(objectName).build();
+  }
+
+  private static GcsItemId itemId(String bucketName, String objectName, long generation) {
+    return GcsItemId.builder()
+        .setBucketName(bucketName)
+        .setObjectName(objectName)
+        .setContentGeneration(generation)
+        .build();
+  }
+
+  private static void populateBothObjectCaches(AnalyticsCacheManager cacheManager, GcsItemId id)
+      throws IOException {
+    cacheManager.getFooter(id, ignored -> FOOTER.duplicate());
+    cacheManager.getSmallObject(id, ignored -> FOOTER.duplicate());
+  }
+
+  private static void assertEvictedFromBothObjectCaches(
+      AnalyticsCacheManager cacheManager, GcsItemId id) throws IOException {
+    AtomicInteger footerLoads = new AtomicInteger(0);
+    AtomicInteger smallObjectLoads = new AtomicInteger(0);
+    cacheManager.getFooter(
+        id,
+        ignored -> {
+          footerLoads.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    cacheManager.getSmallObject(
+        id,
+        ignored -> {
+          smallObjectLoads.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    assertThat(footerLoads.get()).isEqualTo(1);
+    assertThat(smallObjectLoads.get()).isEqualTo(1);
+  }
+
+  private static void assertCachedInBothObjectCaches(
+      AnalyticsCacheManager cacheManager, GcsItemId id) throws IOException {
+    AtomicInteger footerLoads = new AtomicInteger(0);
+    AtomicInteger smallObjectLoads = new AtomicInteger(0);
+    cacheManager.getFooter(
+        id,
+        ignored -> {
+          footerLoads.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    cacheManager.getSmallObject(
+        id,
+        ignored -> {
+          smallObjectLoads.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    assertThat(footerLoads.get()).isEqualTo(0);
+    assertThat(smallObjectLoads.get()).isEqualTo(0);
+  }
+
+  private static void assertBucketPropertiesCached(
+      AnalyticsCacheManager cacheManager, String bucketName) throws IOException {
+    AtomicInteger loads = new AtomicInteger(0);
+    cacheManager.getBucketProperties(
+        bucketName,
+        ignored -> {
+          loads.incrementAndGet();
+          return BucketProperties.create(false, false);
+        });
+    assertThat(loads.get()).isEqualTo(0);
+  }
 }
