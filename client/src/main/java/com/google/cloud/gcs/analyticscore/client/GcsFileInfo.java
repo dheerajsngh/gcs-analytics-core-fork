@@ -15,9 +15,13 @@
  */
 package com.google.cloud.gcs.analyticscore.client;
 
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Strings.isNullOrEmpty;
+
 import com.google.auto.value.AutoValue;
 import com.google.common.collect.ImmutableMap;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.Map;
 
 /**
@@ -55,8 +59,14 @@ public abstract class GcsFileInfo {
     return getItemInfo().exists();
   }
 
+  /** Indicates whether this file or directory is a directory. */
+  public boolean isDirectory() {
+    return getItemInfo().isDirectory();
+  }
+
+  /** Creates a {@link GcsFileInfo} representing a non-existent item at the given {@code uri}. */
   public static GcsFileInfo createNotFound(URI uri) {
-    GcsItemId itemId = UriUtil.getItemIdFromString(uri.toString());
+    GcsItemId itemId = toItemId(uri);
     return builder()
         .setItemInfo(GcsItemInfo.createNotFound(itemId))
         .setUri(uri)
@@ -64,11 +74,73 @@ public abstract class GcsFileInfo {
         .build();
   }
 
+  /**
+   * Creates a {@link GcsFileInfo} representing a non-existent item with the given {@code itemId}.
+   */
   public static GcsFileInfo createNotFound(GcsItemId itemId) {
+    URI uri = toUri(itemId);
     return builder()
         .setItemInfo(GcsItemInfo.createNotFound(itemId))
-        .setUri(URI.create(UriUtil.getStringPath(itemId)))
+        .setUri(uri)
         .setAttributes(ImmutableMap.of())
+        .build();
+  }
+
+  private static URI toUri(GcsItemId itemId) {
+    checkArgument(itemId != null, "itemId should not be null");
+    if (itemId.isRoot()) {
+      return GCS_ROOT_URI;
+    }
+    checkArgument(
+        !itemId.getBucketName().contains("/"), "Invalid GCS itemId bucket name: %s", itemId);
+    try {
+      if (itemId.isBucket()) {
+        return new URI("gs", itemId.getBucketName(), null, null, null);
+      }
+      checkArgument(itemId.isGcsObject(), "Invalid GCS itemId: %s", itemId);
+      return new URI(
+          "gs", itemId.getBucketName(), "/" + itemId.getObjectName().orElse(""), null, null);
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException("Invalid GCS itemId: " + itemId, e);
+    }
+  }
+
+  private static GcsItemId toItemId(URI uri) {
+    checkArgument(uri != null, "uri should not be null");
+    checkArgument("gs".equalsIgnoreCase(uri.getScheme()), "Invalid GCS URI: %s", uri);
+    checkArgument(!uri.isOpaque(), "Invalid GCS URI: %s", uri);
+    checkArgument(
+        uri.getRawQuery() == null && uri.getRawFragment() == null,
+        "GCS URI must not contain query or fragment: %s",
+        uri);
+
+    String authority = uri.getAuthority() != null ? uri.getAuthority() : uri.getHost();
+    if (isNullOrEmpty(authority)) {
+      String rawSchemeSpecificPart = uri.getRawSchemeSpecificPart();
+      checkArgument(
+          "/".equals(rawSchemeSpecificPart) || "//".equals(rawSchemeSpecificPart),
+          "Invalid GCS URI: %s",
+          uri);
+      return GcsItemId.ROOT;
+    }
+
+    checkArgument(!authority.contains("/"), "Invalid GCS URI: %s", uri);
+
+    String rawPath = uri.getRawPath();
+    checkArgument(
+        rawPath == null || !rawPath.contains("//"),
+        "GCS path must not have consecutive '/' characters: %s",
+        uri);
+
+    String decodedPath = uri.getPath();
+    if (isNullOrEmpty(decodedPath) || "/".equals(decodedPath)) {
+      return GcsItemId.builder().setBucketName(authority).build();
+    }
+
+    checkArgument(decodedPath.startsWith("/"), "Invalid GCS URI: %s", uri);
+    return GcsItemId.builder()
+        .setBucketName(authority)
+        .setObjectName(decodedPath.substring(1))
         .build();
   }
 

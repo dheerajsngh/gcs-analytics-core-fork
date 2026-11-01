@@ -21,6 +21,8 @@ import com.google.common.collect.ImmutableMap;
 import java.util.Collections;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 class GcsItemInfoTest {
 
@@ -222,5 +224,84 @@ class GcsItemInfoTest {
             .build();
 
     assertThat(itemInfo.isNativeHnsFolder()).isFalse();
+  }
+
+  @ParameterizedTest
+  @EnumSource(GcsItemInfo.ItemType.class)
+  void isDirectory_existingItem_returnsTrueForAllNonObjectTypes(GcsItemInfo.ItemType itemType) {
+    GcsItemId itemId = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("item").build();
+    GcsItemInfo itemInfo =
+        GcsItemInfo.builder().setItemId(itemId).setSize(0L).setItemType(itemType).build();
+
+    assertThat(itemInfo.exists()).isTrue();
+    assertThat(itemInfo.isDirectory()).isEqualTo(itemType != GcsItemInfo.ItemType.OBJECT);
+  }
+
+  @Test
+  void isDirectory_existingObjectEvenWithTrailingSlashItemId_returnsFalse() {
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_DIR).build();
+    GcsItemInfo itemInfo =
+        GcsItemInfo.builder()
+            .setItemId(itemId)
+            .setSize(10L)
+            .setItemType(GcsItemInfo.ItemType.OBJECT)
+            .build();
+
+    assertThat(itemInfo.exists()).isTrue();
+    assertThat(itemInfo.isDirectory()).isFalse();
+  }
+
+  @Test
+  void isDirectory_factoryMethods_returnExpectedDirectoryStatus() {
+    GcsItemId dirId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_DIR).build();
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+
+    assertThat(GcsItemInfo.createInferredDirectory(dirId).isDirectory()).isTrue();
+    assertThat(GcsItemInfo.createPlaceholderDirectory(dirId).isDirectory()).isTrue();
+    assertThat(GcsItemInfo.createFolder(dirId, 1000L, 2000L, 1L).isDirectory()).isTrue();
+    assertThat(GcsItemInfo.createBucket(bucketId).isDirectory()).isTrue();
+    assertThat(GcsItemInfo.ROOT_INFO.isDirectory()).isTrue();
+  }
+
+  @Test
+  void isDirectory_notFoundFileObject_returnsFalse() {
+    GcsItemId fileId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("non-existent.txt").build();
+
+    GcsItemInfo itemInfo = GcsItemInfo.createNotFound(fileId);
+
+    assertThat(itemInfo.exists()).isFalse();
+    assertThat(itemInfo.isDirectory()).isFalse();
+  }
+
+  @Test
+  void isDirectory_notFoundDirectoryObject_returnsTrue() {
+    GcsItemId dirId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_DIR).build();
+
+    GcsItemInfo itemInfo = GcsItemInfo.createNotFound(dirId);
+
+    assertThat(itemInfo.exists()).isFalse();
+    assertThat(itemInfo.isDirectory()).isTrue();
+  }
+
+  @Test
+  void isDirectory_notFoundBucket_returnsTrue() {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+
+    GcsItemInfo itemInfo = GcsItemInfo.createNotFound(bucketId);
+
+    assertThat(itemInfo.exists()).isFalse();
+    assertThat(itemInfo.isDirectory()).isTrue();
+  }
+
+  @Test
+  void isDirectory_notFoundRoot_returnsTrue() {
+    GcsItemInfo itemInfo = GcsItemInfo.createNotFound(GcsItemId.ROOT);
+
+    assertThat(itemInfo.exists()).isFalse();
+    assertThat(itemInfo.isDirectory()).isTrue();
   }
 }

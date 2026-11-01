@@ -130,6 +130,17 @@ public abstract class GcsItemInfo {
   }
 
   /**
+   * Indicates whether this item represents a directory (including root, buckets, native folders,
+   * placeholder directories, and inferred directories).
+   *
+   * <p>For non-existent items ({@code !exists()}), directory status is determined from {@link
+   * GcsItemId#isDirectory()}.
+   */
+  public boolean isDirectory() {
+    return exists() ? getItemType() != ItemType.OBJECT : getItemId().isDirectory();
+  }
+
+  /**
    * @deprecated Use {@link #getItemType()} and check against {@link ItemType#INFERRED_DIRECTORY}
    *     instead.
    */
