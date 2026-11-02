@@ -20,12 +20,26 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.io.BaseEncoding;
 import java.util.Map;
 import java.util.Optional;
+import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /** Represents metadata of a GCS Item. */
 @AutoValue
 public abstract class GcsItemInfo {
+  /**
+   * Interface for classes (such as write channels and output streams) that can provide finalized
+   * {@link GcsItemInfo} without requiring an additional metadata GET request.
+   */
+  public interface Provider {
+    /**
+     * Returns the finalized {@link GcsItemInfo} for the object, or {@code null} if not available
+     * (for example, before {@code close()} completes or when left unfinalized).
+     */
+    @Nullable
+    GcsItemInfo getItemInfo();
+  }
+
   private static final Logger LOG = LoggerFactory.getLogger(GcsItemInfo.class);
 
   public static final GcsItemInfo ROOT_INFO = createRoot(GcsItemId.ROOT);

@@ -420,4 +420,40 @@ class GoogleCloudStorageOutputStreamTest {
       assertThat(actualBytes).isEqualTo(expectedBytes);
     }
   }
+
+  @Test
+  void getItemInfo_beforeAndAfterClose_returnsNullThenFinalizedItemInfo() throws IOException {
+    byte[] payload = "provider-output-stream-test".getBytes(UTF_8);
+    GoogleCloudStorageOutputStream stream =
+        GoogleCloudStorageOutputStream.create(fakeFileSystem, itemId);
+    assertThat(stream.getItemInfo()).isNull();
+
+    stream.write(payload);
+    stream.close();
+
+    GcsItemInfo itemInfo = stream.getItemInfo();
+    assertThat(itemInfo).isNotNull();
+    assertThat(itemInfo.getItemId().getBucketName()).isEqualTo(itemId.getBucketName());
+    assertThat(itemInfo.getItemId().getObjectName()).hasValue(itemId.getObjectName().get());
+    assertThat(itemInfo.getSize()).isEqualTo(payload.length);
+  }
+
+  @Test
+  void getItemInfo_whenUnderlyingChannelNotProvider_returnsNullBeforeAndAfterClose()
+      throws IOException {
+    GcsFileSystem mockFileSystem = mock(GcsFileSystem.class);
+    WritableByteChannel mockChannel = mock(WritableByteChannel.class);
+    when(mockFileSystem.getTelemetry()).thenReturn(new Telemetry(ImmutableList.of()));
+    when(mockFileSystem.getFileSystemOptions()).thenReturn(fileSystemOptions);
+    when(mockFileSystem.create(any(GcsItemId.class), any())).thenReturn(mockChannel);
+    when(mockChannel.isOpen()).thenReturn(true);
+
+    GoogleCloudStorageOutputStream stream =
+        GoogleCloudStorageOutputStream.create(mockFileSystem, itemId);
+    assertThat(stream.getItemInfo()).isNull();
+
+    stream.close();
+
+    assertThat(stream.getItemInfo()).isNull();
+  }
 }

@@ -21,6 +21,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsFileSystem;
 import com.google.cloud.gcs.analyticscore.client.GcsItemId;
+import com.google.cloud.gcs.analyticscore.client.GcsItemInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsWriteOptions;
 import com.google.cloud.gcs.analyticscore.common.GcsAnalyticsCoreTelemetryConstants.Attribute;
 import com.google.cloud.gcs.analyticscore.common.GcsAnalyticsCoreTelemetryConstants.Metric;
@@ -33,6 +34,7 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.Collections;
+import javax.annotation.Nullable;
 
 /**
  * A unified OutputStream for writing objects to Google Cloud Storage.
@@ -44,7 +46,7 @@ import java.util.Collections;
  * the calling layer (e.g., Iceberg's FileIO or Hadoop's HDFS implementations) to ensure thread
  * safety.
  */
-public class GoogleCloudStorageOutputStream extends OutputStream {
+public class GoogleCloudStorageOutputStream extends OutputStream implements GcsItemInfo.Provider {
 
   private static final ImmutableMap<String, String> COMMON_ATTRIBUTES =
       ImmutableMap.of(Attribute.CLASS_NAME.name(), GoogleCloudStorageOutputStream.class.getName());
@@ -216,5 +218,13 @@ public class GoogleCloudStorageOutputStream extends OutputStream {
    */
   public long getBytesWritten() {
     return totalBytesWritten;
+  }
+
+  @Override
+  @Nullable
+  public GcsItemInfo getItemInfo() {
+    return channel instanceof GcsItemInfo.Provider
+        ? ((GcsItemInfo.Provider) channel).getItemInfo()
+        : null;
   }
 }

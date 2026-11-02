@@ -35,6 +35,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -493,10 +494,58 @@ class GcsWriteChannelTest {
     assertThat(exception)
         .hasMessageThat()
         .contains("Thread interrupted waiting for upload finalization");
+    assertThat(exception).hasCauseThat().isSameInstanceAs(ie);
     assertThat(Thread.currentThread().isInterrupted()).isTrue();
 
     // Clean up interrupt status
     Thread.interrupted();
+  }
+
+  @Test
+  void close_whenFutureThrowsExecutionExceptionWithError_propagatesErrorUnwrapped()
+      throws Exception {
+    BlobWriteSession mockSession = mock(BlobWriteSession.class);
+    ApiFuture<BlobInfo> mockFuture = mock(ApiFuture.class);
+    when(mockSession.getResult()).thenReturn(mockFuture);
+    AssertionError fatalError = new AssertionError("fatal error during finalization");
+    when(mockFuture.get()).thenThrow(new ExecutionException(fatalError));
+    GcsWriteChannel channel = new GcsWriteChannel(mockSession, mockChannel, blobInfo, writeOptions);
+
+    AssertionError thrown = assertThrows(AssertionError.class, channel::close);
+
+    assertThat(thrown).isSameInstanceAs(fatalError);
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void close_whenFutureCancelled_translatesToIOException() throws Exception {
+    BlobWriteSession mockSession = mock(BlobWriteSession.class);
+    ApiFuture<BlobInfo> mockFuture = mock(ApiFuture.class);
+    when(mockSession.getResult()).thenReturn(mockFuture);
+    CancellationException cancelled = new CancellationException("upload cancelled");
+    when(mockFuture.get()).thenThrow(cancelled);
+    GcsWriteChannel channel = new GcsWriteChannel(mockSession, mockChannel, blobInfo, writeOptions);
+
+    IOException thrown = assertThrows(IOException.class, channel::close);
+
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(cancelled);
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void getItemInfo_whenResultBlobInfoHasNullBucketOrName_returnsNullWithoutThrowing()
+      throws Exception {
+    assertThat(GcsClientImpl.fromBlob(null)).isNull();
+
+    BlobInfo missingBucketBlob = mock(BlobInfo.class);
+    when(missingBucketBlob.getBucket()).thenReturn(null);
+    when(missingBucketBlob.getName()).thenReturn(TEST_OBJECT);
+    assertThat(GcsClientImpl.fromBlob(missingBucketBlob)).isNull();
+
+    BlobInfo missingNameBlob = mock(BlobInfo.class);
+    when(missingNameBlob.getBucket()).thenReturn(TEST_BUCKET);
+    when(missingNameBlob.getName()).thenReturn(null);
+    assertThat(GcsClientImpl.fromBlob(missingNameBlob)).isNull();
   }
 
   @Test
@@ -540,5 +589,22 @@ class GcsWriteChannelTest {
 
     verify(mockChannel).close();
     assertThat(channel.isOpen()).isFalse();
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void getItemInfo_beforeAndAfterClose_returnsNullThenFinalizedMetadata() throws Exception {
+    GcsWriteChannel channel = createFakeStorageChannel(TEST_WRITE_OBJECT);
+    assertThat(channel.getItemInfo()).isNull();
+
+    byte[] payload = new byte[] {10, 20, 30, 40, 50};
+    channel.write(ByteBuffer.wrap(payload));
+    channel.close();
+
+    GcsItemInfo itemInfo = channel.getItemInfo();
+    assertThat(itemInfo).isNotNull();
+    assertThat(itemInfo.getItemId().getBucketName()).isEqualTo(TEST_BUCKET);
+    assertThat(itemInfo.getItemId().getObjectName()).hasValue(TEST_WRITE_OBJECT);
+    assertThat(itemInfo.getSize()).isEqualTo(payload.length);
   }
 }

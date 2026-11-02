@@ -18,6 +18,7 @@ package com.google.cloud.gcs.analyticscore.client;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.api.core.ApiFuture;
 import com.google.cloud.storage.BlobAppendableUpload;
 import com.google.cloud.storage.BlobAppendableUpload.AppendableUploadWriteableByteChannel;
 import com.google.cloud.storage.BlobAppendableUploadConfig;
@@ -28,8 +29,11 @@ import com.google.cloud.storage.Storage.BlobWriteOption;
 import com.google.cloud.storage.StorageChannelUtils;
 import com.google.cloud.storage.StorageException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import org.checkerframework.checker.nullness.qual.NonNull;
 
 /**
@@ -40,6 +44,7 @@ import org.checkerframework.checker.nullness.qual.NonNull;
  */
 class GcsBidiWriteChannel extends GcsWriteChannel {
 
+  private final BlobAppendableUpload appendableUploadSession;
   private volatile AppendableUploadWriteableByteChannel gcsAppendChannel;
 
   GcsBidiWriteChannel(
@@ -62,12 +67,12 @@ class GcsBidiWriteChannel extends GcsWriteChannel {
             : CloseAction.CLOSE_WITHOUT_FINALIZING;
 
     try {
-      BlobAppendableUpload session =
+      this.appendableUploadSession =
           storage.blobAppendableUpload(
               blobInfo,
               BlobAppendableUploadConfig.of().withCloseAction(closeAction),
               sdkWriteOptions);
-      this.gcsAppendChannel = session.open();
+      this.gcsAppendChannel = this.appendableUploadSession.open();
     } catch (StorageException e) {
       throw handleException(e, "init");
     }
@@ -114,6 +119,33 @@ class GcsBidiWriteChannel extends GcsWriteChannel {
       if (gcsAppendChannel != null) {
         gcsAppendChannel.close();
       }
+      if (writeOptions.isBidiFinalizeOnClose() && appendableUploadSession != null) {
+        ApiFuture<BlobInfo> resultFuture = appendableUploadSession.getResult();
+        if (resultFuture != null) {
+          BlobInfo resultBlobInfo = resultFuture.get();
+          if (resultBlobInfo != null) {
+            this.finalizedItemInfo = GcsClientImpl.fromBlob(resultBlobInfo);
+          }
+        }
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      InterruptedIOException interrupted =
+          new InterruptedIOException(
+              "Thread interrupted waiting for upload finalization: " + e.getMessage());
+      interrupted.initCause(e);
+      throw interrupted;
+    } catch (CancellationException e) {
+      throw new IOException("GCS upload session was cancelled before finalization", e);
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof Error) {
+        throw (Error) cause;
+      }
+      if (cause instanceof StorageException || cause instanceof IOException) {
+        throw handleException((Exception) cause, "close");
+      }
+      throw new IOException("GCS failed to finalize the appendable upload session", cause);
     } catch (StorageException | IOException e) {
       throw handleException(e, "close");
     } finally {

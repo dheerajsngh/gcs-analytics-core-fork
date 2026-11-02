@@ -401,7 +401,11 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
-  private static GcsItemInfo fromBlob(Blob blob) {
+  @Nullable
+  static GcsItemInfo fromBlob(@Nullable BlobInfo blob) {
+    if (blob == null || blob.getBucket() == null || blob.getName() == null) {
+      return null;
+    }
     GcsItemId.Builder idBuilder =
         GcsItemId.builder().setBucketName(blob.getBucket()).setObjectName(blob.getName());
     Optional.ofNullable(blob.getGeneration()).ifPresent(idBuilder::setContentGeneration);

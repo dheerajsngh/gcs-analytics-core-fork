@@ -16,6 +16,7 @@
 
 package com.google.cloud.gcs.analyticscore.client;
 
+import com.google.api.core.ApiFuture;
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.BlobWriteSession;
 import com.google.cloud.storage.StorageException;
@@ -25,20 +26,23 @@ import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.WritableByteChannel;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /** A unified WritableByteChannel for writing objects to Google Cloud Storage. */
-public class GcsWriteChannel implements WritableByteChannel {
+public class GcsWriteChannel implements WritableByteChannel, GcsItemInfo.Provider {
 
   private static final Logger LOG = LoggerFactory.getLogger(GcsWriteChannel.class);
 
   private final BlobInfo blobInfo;
   private final BlobWriteSession blobWriteSession;
   private volatile WritableByteChannel sdkWriteChannel;
-  private final GcsWriteOptions writeOptions;
+  final GcsWriteOptions writeOptions;
+  protected volatile GcsItemInfo finalizedItemInfo = null;
 
   final AtomicLong bytesWritten = new AtomicLong(0);
   volatile boolean closed = false;
@@ -100,15 +104,29 @@ public class GcsWriteChannel implements WritableByteChannel {
         sdkWriteChannel.close();
       }
       if (blobWriteSession != null) {
-        blobWriteSession.getResult().get();
+        ApiFuture<BlobInfo> resultFuture = blobWriteSession.getResult();
+        if (resultFuture != null) {
+          BlobInfo resultBlobInfo = resultFuture.get();
+          if (resultBlobInfo != null) {
+            this.finalizedItemInfo = GcsClientImpl.fromBlob(resultBlobInfo);
+          }
+        }
       }
       LOG.debug("Successfully closed and finalized object: {}", blobInfo.getBlobId());
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "Thread interrupted waiting for upload finalization: " + e.getMessage());
+      InterruptedIOException interrupted =
+          new InterruptedIOException(
+              "Thread interrupted waiting for upload finalization: " + e.getMessage());
+      interrupted.initCause(e);
+      throw interrupted;
+    } catch (CancellationException e) {
+      throw new IOException("GCS upload session was cancelled before finalization", e);
     } catch (ExecutionException e) {
       Throwable cause = e.getCause();
+      if (cause instanceof Error) {
+        throw (Error) cause;
+      }
       if (cause instanceof StorageException || cause instanceof IOException) {
         throw handleException((Exception) cause, "close");
       }
@@ -118,6 +136,12 @@ public class GcsWriteChannel implements WritableByteChannel {
     } finally {
       sdkWriteChannel = null;
     }
+  }
+
+  @Override
+  @Nullable
+  public GcsItemInfo getItemInfo() {
+    return finalizedItemInfo;
   }
 
   IOException handleException(Exception e, String context) {

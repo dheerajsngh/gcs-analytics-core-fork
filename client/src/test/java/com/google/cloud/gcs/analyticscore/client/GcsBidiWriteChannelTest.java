@@ -24,6 +24,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
 import com.google.cloud.storage.BlobAppendableUpload;
 import com.google.cloud.storage.BlobAppendableUpload.AppendableUploadWriteableByteChannel;
 import com.google.cloud.storage.BlobAppendableUploadConfig;
@@ -34,9 +36,12 @@ import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.Storage.BlobWriteOption;
 import com.google.cloud.storage.StorageException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.file.AccessDeniedException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -320,5 +325,128 @@ class GcsBidiWriteChannelTest {
 
     assertThat(channel.isOpen()).isFalse();
     verify(mockAppendChannel, never()).close();
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void getItemInfo_whenFinalizeOnCloseEnabled_returnsFinalizedMetadataAfterClose()
+      throws Exception {
+    BlobInfo finalizedBlob = Mockito.mock(BlobInfo.class);
+    when(finalizedBlob.getBucket()).thenReturn(TEST_BUCKET);
+    when(finalizedBlob.getName()).thenReturn(TEST_OBJECT);
+    when(finalizedBlob.getGeneration()).thenReturn(987654321L);
+    when(finalizedBlob.getSize()).thenReturn(42L);
+    when(mockSession.getResult()).thenReturn(ApiFutures.immediateFuture(finalizedBlob));
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+    assertThat(channel.getItemInfo()).isNull();
+
+    channel.close();
+
+    GcsItemInfo info = channel.getItemInfo();
+    assertThat(info).isNotNull();
+    assertThat(info.getItemId().getBucketName()).isEqualTo(TEST_BUCKET);
+    assertThat(info.getItemId().getObjectName()).hasValue(TEST_OBJECT);
+    assertThat(info.getItemId().getContentGeneration()).hasValue(987654321L);
+    assertThat(info.getSize()).isEqualTo(42L);
+  }
+
+  @Test
+  void getItemInfo_whenFinalizeOnCloseDisabled_returnsNullAfterClose() throws Exception {
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(false).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+    assertThat(channel.getItemInfo()).isNull();
+
+    channel.close();
+
+    assertThat(channel.getItemInfo()).isNull();
+    verify(mockSession, never()).getResult();
+  }
+
+  @Test
+  void close_whenGetResultInterrupted_preservesInterruptFlagAndThrowsInterruptedIOException()
+      throws Exception {
+    @SuppressWarnings("unchecked")
+    ApiFuture<BlobInfo> mockFuture = Mockito.mock(ApiFuture.class);
+    InterruptedException interrupted = new InterruptedException("interrupted");
+    when(mockFuture.get()).thenThrow(interrupted);
+    when(mockSession.getResult()).thenReturn(mockFuture);
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+
+    try {
+      InterruptedIOException thrown = assertThrows(InterruptedIOException.class, channel::close);
+      assertThat(thrown).hasCauseThat().isSameInstanceAs(interrupted);
+      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+    } finally {
+      Thread.interrupted();
+    }
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void close_whenGetResultFailsWithStorageException_translatesCause() throws Exception {
+    @SuppressWarnings("unchecked")
+    ApiFuture<BlobInfo> mockFuture = Mockito.mock(ApiFuture.class);
+    when(mockFuture.get())
+        .thenThrow(new ExecutionException(new StorageException(403, "Forbidden")));
+    when(mockSession.getResult()).thenReturn(mockFuture);
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+
+    assertThrows(AccessDeniedException.class, channel::close);
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void close_whenGetResultThrowsExecutionExceptionWithError_propagatesErrorUnwrapped()
+      throws Exception {
+    @SuppressWarnings("unchecked")
+    ApiFuture<BlobInfo> mockFuture = Mockito.mock(ApiFuture.class);
+    AssertionError fatalError = new AssertionError("fatal error during finalization");
+    when(mockFuture.get()).thenThrow(new ExecutionException(fatalError));
+    when(mockSession.getResult()).thenReturn(mockFuture);
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+
+    AssertionError thrown = assertThrows(AssertionError.class, channel::close);
+    assertThat(thrown).isSameInstanceAs(fatalError);
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void close_whenGetResultCancelled_translatesToIOException() throws Exception {
+    @SuppressWarnings("unchecked")
+    ApiFuture<BlobInfo> mockFuture = Mockito.mock(ApiFuture.class);
+    CancellationException cancelled = new CancellationException("session cancelled");
+    when(mockFuture.get()).thenThrow(cancelled);
+    when(mockSession.getResult()).thenReturn(mockFuture);
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+
+    IOException thrown = assertThrows(IOException.class, channel::close);
+    assertThat(thrown).hasCauseThat().isSameInstanceAs(cancelled);
+    assertThat(channel.getItemInfo()).isNull();
+  }
+
+  @Test
+  void getItemInfo_whenResultBlobInfoHasNullBucketOrName_returnsNullWithoutThrowing()
+      throws Exception {
+    BlobInfo partialBlob = Mockito.mock(BlobInfo.class);
+    when(partialBlob.getBucket()).thenReturn(null);
+    when(partialBlob.getName()).thenReturn(null);
+    when(mockSession.getResult()).thenReturn(ApiFutures.immediateFuture(partialBlob));
+
+    GcsWriteOptions options = GcsWriteOptions.builder().setBidiFinalizeOnClose(true).build();
+    GcsBidiWriteChannel channel = createChannel(options);
+
+    channel.close();
+
+    assertThat(channel.getItemInfo()).isNull();
   }
 }
