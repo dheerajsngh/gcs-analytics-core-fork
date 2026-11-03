@@ -22,8 +22,8 @@ Project conventions, architecture, and coding patterns for the `gcs-analytics-co
 
 ## Design Patterns
 
-- **Immutability**: Prefer immutable value types. Use `com.google.auto.value.AutoValue` for data-carrying classes.
-- **Guava Utilities**: Use Guava's `Preconditions` for argument validation and `Verify` for internal state checks.
+- **Immutability**: Prefer immutable value types. Use `com.google.auto.value.AutoValue` for data-carrying classes, using JDK collection interfaces (`List`, `Set`, `Map` defensive-copied via `List.copyOf` / `Set.copyOf` / `Map.copyOf`) in getters and builder setters rather than Guava `Immutable*` types.
+- **Guava Utilities**: Use Guava's `Preconditions` for argument validation and `Verify` for internal state checks inside method bodies (never in class/method/builder signatures on public types).
 - **Fluent APIs**: Where appropriate, use the builder pattern or fluent interfaces to improve readability.
 - **Resource Management**: Always use `try-with-resources` for `AutoCloseable` types (streams, clients, etc.).
 - **Error Handling**: Use standard Java exceptions or custom exceptions defined in the project. Avoid swallowing exceptions.
@@ -36,6 +36,7 @@ Project conventions, architecture, and coding patterns for the `gcs-analytics-co
 - **Javadoc**: Required for all public classes and methods. Follow Google Javadoc style.
 - **Nullability**: Use `@Nullable` and `@NonNull` (or equivalent) to document nullability expectations.
 - **Interface Stability**: Avoid breaking public interfaces. Add default methods if extending existing interfaces.
+- **JDK-Only API Signatures (No Guava Leaks)**: Never expose `com.google.common.*` types (`ImmutableList`, `ImmutableSet`, `ImmutableMap`, Guava `Supplier`/`Function`/`Predicate`, `HostAndPort`, etc.) in field, constructor, method, or `@AutoValue.Builder` setter signatures on public classes or interfaces in `client/` and `core/`—including `private` or `package-private` overloads on public classes. Downstream consumers (such as Apache Iceberg) exclude Guava from their compile classpath, and `javac` overload and hierarchy resolution loads parameter/return types across all declared overloads. Use JDK 11 standard library types (`List`, `Set`, `Map`, `Optional`, `java.util.function.*`) in signatures.
 
 ### Naming
 

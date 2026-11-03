@@ -12,6 +12,7 @@ This guide ensures code quality, performance, and maintainability for the `gcs-a
 *   **Dependency Hygiene:** Do not introduce new dependencies without license validation (Apache 2.0 preferred). Avoid dependency bloat to minimize classpath conflicts in Spark/Hadoop environments (shaded jars are preferred if internal shading is used).
 *   **Java Version Compatibility:** The project targets **JDK 11+** (`maven.compiler.release=11`). Standard library APIs from Java 9 through Java 11 are fully supported; do not flag Java 9–11 APIs for Java 8 compatibility, and do not use APIs introduced in Java 12 or later.
 *   **Binary & Semantic Compatibility:** Public APIs in `client` and `core` must maintain backward compatibility. Do not change method signatures; prefer `default` interface methods or deprecation cycles.
+*   **No Guava Types in Public Class Signatures:** Do **NOT** expose `com.google.common.*` (Guava) types in fields, constructors, methods, `@AutoValue` getters, or `@AutoValue.Builder` setters on public classes or interfaces in `client` and `core`—including `private` or `package-private` constructor or setter overloads on public types. Downstream consumers (such as Apache Iceberg) compile without Guava on their compile classpath, and `javac` overload/supertype resolution inspects all declared overloads. Use JDK 11 types (`List`, `Set`, `Map` backed by `List.copyOf` / `Set.copyOf` / `Map.copyOf`, `Optional`, `java.util.function.Supplier`, `java.util.function.Predicate`) in signatures.
 *   **No Internal State Leaks:** Ensure internal classes remain package-private to prevent users from binding to unstable internals.
 *   **Security & Data Governance:** **NEVER** log, expose, or commit credentials, access tokens, or private keys. Be extremely careful about logging complete GCS URIs or object names at `INFO` level or higher if they might contain sensitive user data (PII). Sanitize exception messages to ensure they don't leak internal tokens.
 
@@ -42,7 +43,7 @@ This guide ensures code quality, performance, and maintainability for the `gcs-a
 ## 🛠️ 4. Google Best Practices & Code Style
 *The project adheres strictly to Google Java Style and standards.*
 
-*   **Guava Utilities:** Use `Preconditions` for arguments and `Verify` for internal state. Do not invent custom validation logic.
+*   **Guava Utilities:** Use `Preconditions` for arguments and `Verify` for internal state inside method bodies. Do not invent custom validation logic, and never expose Guava types in public class or `@AutoValue.Builder` signatures (see Section 1).
 *   **Null Safety:** Strictly annotate methods and parameters with `@Nullable` or `@NonNull`. Prefer `Optional` for return types over `null` where appropriate (avoid `Optional` in performance-critical inner loops).
 *   **Fluent APIs:** Use Builder patterns for complex object creation to improve readability.
 *   **Fail-Fast:** Validate inputs at the boundary (public methods) immediately.
@@ -76,4 +77,4 @@ When reviewing or generating code for this project, you **MUST**:
 2.  Check for potential memory leaks or unclosed resources.
 3.  Ensure no proprietary libraries or unapproved dependencies are used.
 4.  Scrutinize I/O paths for performance bottlenecks (e.g., excessive seeking or blocking).
-5.  Enforce Google Java Style and Guava usage.
+5.  Enforce Google Java Style, Guava `Preconditions`/`Verify` usage inside method bodies, and strictly JDK-only type signatures on public classes/builders in `client` and `core` (flag any `com.google.common.*` type in field, constructor, method, or `@AutoValue.Builder` signatures).
