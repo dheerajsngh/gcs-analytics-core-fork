@@ -15,6 +15,8 @@
  */
 package com.google.cloud.gcs.analyticscore.client;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import com.google.cloud.gcs.analyticscore.common.telemetry.Telemetry;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -22,6 +24,7 @@ import java.net.URI;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.List;
 
 public interface GcsFileSystem extends AutoCloseable {
 
@@ -99,6 +102,65 @@ public interface GcsFileSystem extends AutoCloseable {
    * @throws IOException if the metadata cannot be fetched
    */
   GcsFileInfo getFileInfoObject(GcsItemId itemId) throws IOException;
+
+  /**
+   * Lists the object, or the immediate children of the directory or bucket, at the given {@code
+   * gs://} path.
+   *
+   * <p>Semantics follow {@link #listFileInfo(GcsItemId)}. Consistent with {@link
+   * #getFileInfo(URI)}, {@code path.toString()} is parsed literally without percent-decoding, so
+   * for object names containing characters that {@link GcsFileInfo#getUri()} percent-encodes (such
+   * as spaces, {@code #}, {@code ?} and {@code %}), call {@link #listFileInfo(GcsItemId)} instead.
+   *
+   * <p>The default implementation parses {@code path} and calls {@link #listFileInfo(GcsItemId)}.
+   *
+   * @param path the {@code gs://} path of the object, directory or bucket to list
+   * @return an unmodifiable list of the listed items, as described in {@link
+   *     #listFileInfo(GcsItemId)}
+   * @throws IllegalArgumentException if {@code path} is not a valid {@code gs://} URI
+   * @throws FileNotFoundException if neither an object nor a directory exists at {@code path}, or
+   *     if the bucket does not exist
+   * @throws UnsupportedOperationException if {@code path} is the root {@code gs://}, or if this
+   *     implementation does not support {@link #listFileInfo(GcsItemId)}
+   * @throws AccessDeniedException if the caller lacks permission to read or list {@code path}
+   * @throws IOException if the object lookup or the listing fails
+   */
+  default List<GcsFileInfo> listFileInfo(URI path) throws IOException {
+    checkNotNull(path, "path should not be null");
+    return listFileInfo(UriUtil.getItemIdFromUri(path));
+  }
+
+  /**
+   * Lists the given object, or the immediate children of the given directory or bucket, following
+   * hadoop-connectors {@code GoogleCloudStorageFileSystem.listFileInfo}.
+   *
+   * <p>If {@code itemId} names an existing object (its object name does not end in {@code /}), the
+   * result is a single-element list with that object, even if a directory with the same name also
+   * exists. Otherwise the result is the immediate children of the directory or bucket: objects,
+   * child placeholder directories (such as a {@code dir/sub/} object), and implicit or native
+   * subdirectories as inferred directories. The directory's own placeholder object is excluded, and
+   * an existing empty directory or bucket yields an empty list. The children are sorted by path:
+   * shorter {@link GcsFileInfo#getUri()} strings first, then lexicographically.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}, so that
+   * implementations written against earlier versions of this interface keep compiling; {@link
+   * GcsFileSystemImpl} overrides it.
+   *
+   * @param itemId the object, directory or bucket to list
+   * @return an unmodifiable list of the listed items
+   * @throws IllegalArgumentException if {@code itemId} has an empty bucket name with a non-empty
+   *     object name
+   * @throws FileNotFoundException if neither an object nor a directory exists at {@code itemId}, or
+   *     if the bucket does not exist
+   * @throws UnsupportedOperationException if {@code itemId} is the root {@code gs://}, or if this
+   *     implementation does not support listing
+   * @throws AccessDeniedException if the caller lacks permission to read or list {@code itemId}
+   * @throws IOException if the object lookup or the listing fails
+   */
+  default List<GcsFileInfo> listFileInfo(GcsItemId itemId) throws IOException {
+    throw new UnsupportedOperationException(
+        "listFileInfo is not supported by " + getClass().getName());
+  }
 
   /** Retrieve the options that were used to create this GcsFileSystem. */
   GcsFileSystemOptions getFileSystemOptions();

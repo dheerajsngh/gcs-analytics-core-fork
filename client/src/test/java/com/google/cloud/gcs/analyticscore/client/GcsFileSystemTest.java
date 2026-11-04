@@ -20,11 +20,13 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /** Tests the default methods of {@link GcsFileSystem}. */
@@ -33,6 +35,43 @@ class GcsFileSystemTest {
   private static final URI DIR_URI = URI.create("gs://test-bucket/dir/");
   private static final GcsItemId DIR_ITEM_ID =
       GcsItemId.builder().setBucketName("test-bucket").setObjectName("dir/").build();
+
+  @Test
+  void listFileInfo_itemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class, () -> fileSystem.listFileInfo(DIR_ITEM_ID));
+    assertThat(e).hasMessageThat().startsWith("listFileInfo is not supported by ");
+  }
+
+  @Test
+  void listFileInfo_uri_delegatesToItemIdOverload() throws IOException {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+    List<GcsFileInfo> fileInfos = List.of(GcsFileInfo.createNotFound(DIR_ITEM_ID));
+    doReturn(fileInfos).when(fileSystem).listFileInfo(DIR_ITEM_ID);
+
+    List<GcsFileInfo> result = fileSystem.listFileInfo(DIR_URI);
+
+    assertThat(result).isSameInstanceAs(fileInfos);
+  }
+
+  @Test
+  void listFileInfo_uriWithItemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    assertThrows(UnsupportedOperationException.class, () -> fileSystem.listFileInfo(DIR_URI));
+  }
+
+  @Test
+  void listFileInfo_nullUri_throwsNullPointerException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    NullPointerException e =
+        assertThrows(NullPointerException.class, () -> fileSystem.listFileInfo((URI) null));
+    assertThat(e).hasMessageThat().isEqualTo("path should not be null");
+  }
 
   @Test
   void mkdirs_itemIdNotOverridden_throwsUnsupportedOperationException() {

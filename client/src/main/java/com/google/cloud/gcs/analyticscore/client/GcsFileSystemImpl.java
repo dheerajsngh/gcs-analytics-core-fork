@@ -30,7 +30,6 @@ import com.google.cloud.gcs.analyticscore.common.telemetry.OpenTelemetryReporter
 import com.google.cloud.gcs.analyticscore.common.telemetry.OperationListener;
 import com.google.cloud.gcs.analyticscore.common.telemetry.Telemetry;
 import com.google.cloud.gcs.analyticscore.common.telemetry.TelemetryOptions;
-import com.google.cloud.storage.BlobId;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
@@ -42,11 +41,14 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -54,6 +56,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,6 +78,15 @@ public class GcsFileSystemImpl implements GcsFileSystem {
 
   /** Timeout in seconds for background thread pools to terminate when closing the file system. */
   private static final int EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 10;
+
+  /**
+   * Sorts listed items like hadoop-connectors {@code FILE_INFO_PATH_COMPARATOR}: shorter {@code
+   * gs://} URI strings first, then lexicographically.
+   */
+  private static final Comparator<GcsFileInfo> LIST_FILE_INFO_PATH_COMPARATOR =
+      Comparator.comparing(
+          (GcsFileInfo fileInfo) -> fileInfo.getUri().toString(),
+          Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()));
 
   private final GcsClient gcsClient;
   private final GcsFileSystemOptions fileSystemOptions;
@@ -243,6 +255,45 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     return toGcsFileInfo(gcsClient.getGcsItemInfo(itemId));
   }
 
+  @Override
+  public List<GcsFileInfo> listFileInfo(GcsItemId itemId) throws IOException {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.isRoot()) {
+      // Listing the root means listing buckets, which needs a listBuckets API in GcsClient.
+      throw new UnsupportedOperationException("Listing gs:// is not supported");
+    }
+    checkArgument(
+        !itemId.getBucketName().isEmpty(),
+        "Expected a bucket, directory or object but got: %s",
+        itemId);
+    List<GcsItemInfo> itemInfos;
+    if (itemId.isDirectory()) {
+      itemInfos = resolveStrategy(itemId.getBucketName()).listDirectory(itemId);
+    } else {
+      // An object wins over a same-named directory. List the directory in the background (or
+      // lazily, if parallel metadata lookup is disabled) while looking up the object.
+      Future<List<GcsItemInfo>> listingFuture =
+          statusExecutorServiceSupplier
+              .get()
+              .submit(() -> resolveStrategy(itemId.getBucketName()).listDirectory(itemId));
+      try {
+        GcsItemInfo objectInfo = gcsClient.getGcsItemInfo(itemId);
+        listingFuture.cancel(true);
+        return List.of(toGcsFileInfo(objectInfo));
+      } catch (FileNotFoundException ignored) {
+        LOG.debug("Object '{}' not found, listing it as a directory.", itemId);
+      } catch (Exception e) {
+        listingFuture.cancel(true);
+        throw e;
+      }
+      itemInfos = getFromFuture(listingFuture);
+    }
+    return itemInfos.stream()
+        .map(this::toGcsFileInfo)
+        .sorted(LIST_FILE_INFO_PATH_COMPARATOR)
+        .collect(Collectors.toUnmodifiableList());
+  }
+
   /**
    * Retrieves file or directory metadata for the given {@link GcsItemId}.
    *
@@ -325,11 +376,27 @@ public class GcsFileSystemImpl implements GcsFileSystem {
 
   private GcsFileInfo toGcsFileInfo(GcsItemInfo gcsItemInfo) {
     GcsItemId itemId = gcsItemInfo.getItemId();
+    String objectName = itemId.getObjectName().orElse("");
+    URI uri;
+    try {
+      // Unlike URI.create("gs://bucket/" + objectName), this quotes characters such as spaces, '#',
+      // '?' and '%', so that uri.getPath() returns the exact object name after the leading "/".
+      uri =
+          new URI(
+              "gs",
+              itemId.getBucketName(),
+              PATH_DELIMITER + objectName,
+              /* query= */ null,
+              /* fragment= */ null);
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Invalid bucket name (%s) or object name (%s)", itemId.getBucketName(), objectName),
+          e);
+    }
     return GcsFileInfo.builder()
         .setItemInfo(gcsItemInfo)
-        .setUri(
-            URI.create(
-                BlobId.of(itemId.getBucketName(), itemId.getObjectName().orElse("")).toGsUtilUri()))
+        .setUri(uri)
         .setAttributes(gcsItemInfo.getExtendedAttributes())
         .build();
   }

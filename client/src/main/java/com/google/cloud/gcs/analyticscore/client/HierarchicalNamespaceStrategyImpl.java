@@ -19,7 +19,9 @@ package com.google.cloud.gcs.analyticscore.client;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -54,5 +56,25 @@ final class HierarchicalNamespaceStrategyImpl implements NamespaceStrategy {
     // In HNS buckets, directories are always native folder resources; pass the ID as given so a
     // not-found error names the path the caller asked for, as in FlatNamespaceStrategyImpl.
     return gcsClient.getFolderInfo(id);
+  }
+
+  /**
+   * Lists the folder with {@link GcsListOptions#LIST_DIRECTORY_HNS}, which also returns child
+   * folders as prefixes. An empty folder lists nothing, so when nothing is listed for an object
+   * path, {@link GcsClient#getFolderInfo} checks that the folder exists.
+   */
+  @Override
+  public List<GcsItemInfo> listDirectory(GcsItemId id) throws IOException {
+    checkNotNull(id, "Item ID must not be null.");
+    DirectoryListing listing =
+        DirectoryListing.list(gcsClient, id, GcsListOptions.LIST_DIRECTORY_HNS);
+    if (!listing.isDirectoryFound() && id.isGcsObject()) {
+      if (Thread.currentThread().isInterrupted()) {
+        throw new InterruptedIOException("Interrupted while listing " + id);
+      }
+      // Throws FileNotFoundException naming id if the folder does not exist.
+      gcsClient.getFolderInfo(id);
+    }
+    return listing.getChildren();
   }
 }

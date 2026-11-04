@@ -20,6 +20,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.List;
 
 /**
  * Strategy interface for handling directory operations across different namespace models (Flat vs.
@@ -30,7 +31,6 @@ import java.nio.file.FileAlreadyExistsException;
  * <ul>
  *   <li>{@code boolean isDirectoryEmpty(GcsItemId id) throws IOException;}
  *   <li>{@code void renameDirectory(GcsItemId src, GcsItemId dst) throws IOException;}
- *   <li>{@code java.util.List<GcsItemInfo> listObjectInfo(GcsItemId id) throws IOException;}
  *   <li>{@code java.util.List<GcsItemInfo> listRecursive(GcsItemId id) throws IOException;}
  * </ul>
  */
@@ -89,4 +89,24 @@ interface NamespaceStrategy {
    * @throws IOException if an I/O error occurs
    */
   GcsItemInfo getDirectoryInfo(GcsItemId id, boolean inferImplicitDirectories) throws IOException;
+
+  /**
+   * Lists the immediate children of the directory {@code id.toDirectoryId()}, fetching every page
+   * of results; a bucket {@code id} lists the bucket root.
+   *
+   * <p>The children are objects, including child placeholder objects such as {@code dir/sub/}, and
+   * subdirectories without such an object (implicit directories and, on hierarchical namespace
+   * buckets, native folders), which are returned as inferred directories. The directory's own
+   * placeholder object is excluded, and each object name is returned once: an object wins over an
+   * inferred directory with the same name.
+   *
+   * @param id the directory (with or without a trailing {@code "/"}) or bucket to list
+   * @return an unmodifiable list of the immediate children in unspecified order, empty for an
+   *     existing empty directory or bucket
+   * @throws FileNotFoundException if {@code id} is an object path whose directory does not exist,
+   *     or if the bucket does not exist
+   * @throws AccessDeniedException if the caller lacks permission to list the directory
+   * @throws IOException if an I/O error occurs while listing
+   */
+  List<GcsItemInfo> listDirectory(GcsItemId id) throws IOException;
 }

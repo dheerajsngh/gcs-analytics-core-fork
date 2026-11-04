@@ -18,9 +18,12 @@ package com.google.cloud.gcs.analyticscore.client;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -28,7 +31,9 @@ import static org.mockito.Mockito.when;
 import com.google.cloud.storage.StorageException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -261,11 +266,186 @@ class FlatNamespaceStrategyImplTest {
     verify(mockClient).getGcsItemInfo(dirIdWithSlash);
   }
 
+  @Test
+  void listDirectory_nullItemId_throwsNullPointerException() {
+    assertThrows(NullPointerException.class, () -> strategy.listDirectory(null));
+  }
+
+  @Test
+  void listDirectory_objectsAndPrefixes_returnsObjectsAndInferredDirectories() throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR);
+    GcsItemInfo file = createGcsItemInfo(TEST_DIR + "/file.txt", 100L);
+    GcsItemInfo childPlaceholder = createPlaceholderInfo(TEST_DIR + "/sub/");
+    GcsItemId implicitDirId = createGcsItemId(TEST_DIR + "/implicit/");
+    when(mockClient.listObjectsPage(dirId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            listPage(List.of(file, childPlaceholder), List.of(implicitDirId), Optional.empty()));
+
+    List<GcsItemInfo> children = strategy.listDirectory(dirId);
+
+    assertThat(children)
+        .containsExactly(
+            file, childPlaceholder, GcsItemInfo.createInferredDirectory(implicitDirId));
+  }
+
+  @Test
+  void listDirectory_multiplePages_followsPageTokensAndDeduplicatesAcrossPages()
+      throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR + "/");
+    GcsItemInfo file = createGcsItemInfo(TEST_DIR + "/file.txt", 100L);
+    GcsItemInfo firstPlaceholder = createPlaceholderInfo(TEST_DIR + "/first/");
+    GcsItemInfo laterPlaceholder = createPlaceholderInfo(TEST_DIR + "/later/");
+    GcsItemId firstPrefix = createGcsItemId(TEST_DIR + "/first/");
+    GcsItemId laterPrefix = createGcsItemId(TEST_DIR + "/later/");
+    GcsItemId implicitDirId = createGcsItemId(TEST_DIR + "/implicit/");
+    // "first/" is listed as an object before its prefix, and "later/" as a prefix before its
+    // object.
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            listPage(
+                List.of(file, firstPlaceholder), List.of(laterPrefix), Optional.of("token-1")));
+    when(mockClient.listObjectsPage(dirId, listDirectoryOptions("token-1")))
+        .thenReturn(
+            listPage(List.of(laterPlaceholder), List.of(implicitDirId), Optional.of("token-2")));
+    when(mockClient.listObjectsPage(dirId, listDirectoryOptions("token-2")))
+        .thenReturn(listPage(List.of(), List.of(firstPrefix, implicitDirId), Optional.empty()));
+
+    List<GcsItemInfo> children = strategy.listDirectory(dirId);
+
+    assertThat(children)
+        .containsExactly(
+            file,
+            firstPlaceholder,
+            laterPlaceholder,
+            GcsItemInfo.createInferredDirectory(implicitDirId));
+    verify(mockClient).listObjectsPage(dirId, listDirectoryOptions("token-1"));
+    verify(mockClient).listObjectsPage(dirId, listDirectoryOptions("token-2"));
+    verify(mockClient, times(3)).listObjectsPage(eq(dirId), any());
+  }
+
+  @Test
+  void listDirectory_placeholderListedAsPrefixObject_excludesPlaceholder() throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR);
+    GcsItemInfo file = createGcsItemInfo(TEST_DIR + "/file.txt", 100L);
+    when(mockClient.listObjectsPage(dirId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setItems(List.of(file))
+                .setPrefixObject(createPlaceholderInfo(TEST_DIR + "/"))
+                .build());
+
+    List<GcsItemInfo> children = strategy.listDirectory(dirId);
+
+    assertThat(children).containsExactly(file);
+  }
+
+  @Test
+  void listDirectory_emptyDirectoryWithPlaceholderOnEarlierPage_returnsEmptyList()
+      throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR + "/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixObject(createPlaceholderInfo(TEST_DIR + "/"))
+                .setNextPageToken("token-1")
+                .build());
+    when(mockClient.listObjectsPage(dirId, listDirectoryOptions("token-1")))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+
+    List<GcsItemInfo> children = strategy.listDirectory(dirId);
+
+    assertThat(children).isEmpty();
+  }
+
+  @Test
+  void listDirectory_interruptedBetweenPages_throwsInterruptedIOException() throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR + "/");
+    GcsItemInfo file = createGcsItemInfo(TEST_DIR + "/file.txt", 100L);
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenAnswer(
+            invocation -> {
+              Thread.currentThread().interrupt();
+              return listPage(List.of(file), List.of(), Optional.of("token-1"));
+            });
+
+    try {
+      InterruptedIOException e =
+          assertThrows(InterruptedIOException.class, () -> strategy.listDirectory(dirId));
+
+      assertThat(e).hasMessageThat().isEqualTo("Interrupted while listing " + dirId);
+      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+      verify(mockClient, times(1)).listObjectsPage(any(), any());
+    } finally {
+      Thread.interrupted();
+    }
+  }
+
+  @Test
+  void listDirectory_missingDirectory_throwsFileNotFoundExceptionNamingItemId() throws IOException {
+    GcsItemId dirId = createGcsItemId(TEST_DIR);
+    when(mockClient.listObjectsPage(dirId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+
+    FileNotFoundException e =
+        assertThrows(FileNotFoundException.class, () -> strategy.listDirectory(dirId));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Location does not exist or generation not found: gs://"
+                + TEST_BUCKET
+                + "/"
+                + TEST_DIR);
+    verify(mockClient, never()).getFolderInfo(any());
+  }
+
+  @Test
+  void listDirectory_emptyBucket_returnsEmptyList() throws IOException {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+
+    List<GcsItemInfo> children = strategy.listDirectory(bucketId);
+
+    assertThat(children).isEmpty();
+  }
+
+  @Test
+  void listDirectory_missingBucket_throwsFileNotFoundException() throws IOException {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    FileNotFoundException bucketNotFound =
+        GcsExceptionUtil.createBucketNotFoundException(TEST_BUCKET);
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.LIST_DIRECTORY))
+        .thenThrow(bucketNotFound);
+
+    FileNotFoundException e =
+        assertThrows(FileNotFoundException.class, () -> strategy.listDirectory(bucketId));
+
+    assertThat(e).isSameInstanceAs(bucketNotFound);
+  }
+
   private static GcsItemId createGcsItemId(String objectName) {
     return GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(objectName).build();
   }
 
   private static GcsItemInfo createGcsItemInfo(String objectName, long size) {
     return GcsItemInfo.builder().setItemId(createGcsItemId(objectName)).setSize(size).build();
+  }
+
+  private static GcsItemInfo createPlaceholderInfo(String objectName) {
+    return GcsItemInfo.createPlaceholderDirectory(createGcsItemId(objectName));
+  }
+
+  private static GcsListOptions listDirectoryOptions(String pageToken) {
+    return GcsListOptions.LIST_DIRECTORY.toBuilder().setPageToken(pageToken).build();
+  }
+
+  private static GcsListPage<GcsItemInfo> listPage(
+      List<GcsItemInfo> items, List<GcsItemId> prefixes, Optional<String> nextPageToken) {
+    return GcsListPage.<GcsItemInfo>builder()
+        .setItems(items)
+        .setPrefixes(prefixes)
+        .setNextPageToken(nextPageToken)
+        .build();
   }
 }
