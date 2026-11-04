@@ -28,6 +28,7 @@ import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.api.core.ApiFuture;
@@ -101,7 +102,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -125,6 +128,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 
@@ -310,6 +314,351 @@ class GcsClientImplTest {
             FileNotFoundException.class, () -> gcsClient.getGcsItemInfo(nonExistentItemId));
     assertThat(e.getCause()).isInstanceOf(StorageException.class);
     assertThat(((StorageException) e.getCause()).getCode()).isEqualTo(404);
+  }
+
+  @Test
+  void moveObjects_emptyMap_doesNotCallStorage() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    clientWithMock.moveObjects(ImmutableMap.of());
+
+    verifyNoInteractions(mockStorage);
+  }
+
+  @Test
+  void moveObjects_singleAndMultipleObjects_sendsExpectedMoveBlobRequests() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    Map<GcsItemId, GcsItemId> moves =
+        ImmutableMap.of(
+            moveObjectsId("src1"),
+            moveObjectsId("dst1"),
+            moveObjectsId("src2", 7L),
+            moveObjectsId("dst2", 0L),
+            moveObjectsId("src3", 9L),
+            moveObjectsId("dst3", 5L));
+
+    clientWithMock.moveObjects(moves);
+
+    ArgumentCaptor<Storage.MoveBlobRequest> requestCaptor =
+        ArgumentCaptor.forClass(Storage.MoveBlobRequest.class);
+    verify(mockStorage, times(3)).moveBlob(requestCaptor.capture());
+    assertThat(requestCaptor.getAllValues())
+        .containsExactly(
+            Storage.MoveBlobRequest.newBuilder()
+                .setSource(BlobId.of(TEST_BUCKET, "src1"))
+                .setTarget(BlobId.of(TEST_BUCKET, "dst1"))
+                .build(),
+            Storage.MoveBlobRequest.newBuilder()
+                .setSource(BlobId.of(TEST_BUCKET, "src2"))
+                .setTarget(BlobId.of(TEST_BUCKET, "dst2"))
+                .setSourceOptions(Storage.BlobSourceOption.generationMatch(7L))
+                .setTargetOptions(Storage.BlobTargetOption.generationMatch(0L))
+                .build(),
+            Storage.MoveBlobRequest.newBuilder()
+                .setSource(BlobId.of(TEST_BUCKET, "src3"))
+                .setTarget(BlobId.of(TEST_BUCKET, "dst3"))
+                .setSourceOptions(Storage.BlobSourceOption.generationMatch(9L))
+                .setTargetOptions(Storage.BlobTargetOption.generationMatch(5L))
+                .build());
+  }
+
+  @Test
+  void moveObjects_withEncryptionKeysAndWriteUserProject_sendsKeyAndUserProjectOptions()
+      throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    String readDecryptionKey = "MDEyMzQ1Njc4OUFCQ0RFRkdISUpLTE1OT1BRUlNUVVU=";
+    GcsClientOptions clientOptions =
+        TEST_GCS_CLIENT_OPTIONS.toBuilder()
+            .setGcsReadOptions(
+                GcsReadOptions.builder()
+                    .setDecryptionKey(readDecryptionKey)
+                    .setUserProjectId("read-project")
+                    .build())
+            .setGcsWriteOptions(
+                GcsWriteOptions.builder()
+                    .setEncryptionKey(TEST_ENCRYPTION_KEY)
+                    .setUserProject("write-project")
+                    .build())
+            .build();
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage, clientOptions);
+
+    clientWithMock.moveObjects(ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst")));
+
+    ArgumentCaptor<Storage.MoveBlobRequest> requestCaptor =
+        ArgumentCaptor.forClass(Storage.MoveBlobRequest.class);
+    verify(mockStorage).moveBlob(requestCaptor.capture());
+    assertThat(requestCaptor.getValue())
+        .isEqualTo(
+            Storage.MoveBlobRequest.newBuilder()
+                .setSource(BlobId.of(TEST_BUCKET, "src"))
+                .setTarget(BlobId.of(TEST_BUCKET, "dst"))
+                .setSourceOptions(
+                    Storage.BlobSourceOption.decryptionKey(readDecryptionKey),
+                    Storage.BlobSourceOption.userProject("write-project"))
+                .setTargetOptions(Storage.BlobTargetOption.encryptionKey(TEST_ENCRYPTION_KEY))
+                .build());
+  }
+
+  @Test
+  void moveObjects_withReadUserProjectFallback_sendsReadUserProject() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientOptions clientOptions =
+        TEST_GCS_CLIENT_OPTIONS.toBuilder()
+            .setGcsReadOptions(GcsReadOptions.builder().setUserProjectId("read-project").build())
+            .build();
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage, clientOptions);
+
+    clientWithMock.moveObjects(ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst")));
+
+    ArgumentCaptor<Storage.MoveBlobRequest> requestCaptor =
+        ArgumentCaptor.forClass(Storage.MoveBlobRequest.class);
+    verify(mockStorage).moveBlob(requestCaptor.capture());
+    assertThat(requestCaptor.getValue())
+        .isEqualTo(
+            Storage.MoveBlobRequest.newBuilder()
+                .setSource(BlobId.of(TEST_BUCKET, "src"))
+                .setTarget(BlobId.of(TEST_BUCKET, "dst"))
+                .setSourceOptions(Storage.BlobSourceOption.userProject("read-project"))
+                .build());
+  }
+
+  @Test
+  void moveObjects_nullMap_throwsNullPointerException() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    NullPointerException e =
+        assertThrows(NullPointerException.class, () -> clientWithMock.moveObjects(null));
+
+    assertThat(e).hasMessageThat().isEqualTo("srcToDstItemIds must not be null");
+    verifyNoInteractions(mockStorage);
+  }
+
+  private static Stream<Arguments> moveObjectsInvalidEntryCases() {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId otherBucketDstId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET_NAME).setObjectName("dst").build();
+    Map<GcsItemId, GcsItemId> validThenInvalid = new LinkedHashMap<>();
+    validThenInvalid.put(moveObjectsId("src1"), moveObjectsId("dst1"));
+    validThenInvalid.put(moveObjectsId("same"), moveObjectsId("same"));
+    return Stream.of(
+        Arguments.of(
+            Collections.singletonMap(null, moveObjectsId("dst")), "Expected a GCS object srcId"),
+        Arguments.of(
+            Collections.singletonMap(moveObjectsId("src"), null), "Expected a GCS object dstId"),
+        Arguments.of(
+            ImmutableMap.of(bucketId, moveObjectsId("dst")), "Expected a GCS object srcId"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src"), bucketId), "Expected a GCS object dstId"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src"), otherBucketDstId),
+            "Cannot move objects across buckets"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src", 7L), moveObjectsId("src")),
+            "Move destination must be different from source"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src", 0L), moveObjectsId("dst")),
+            "Source generation must be positive but got: 0"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src", -1L), moveObjectsId("dst")),
+            "Source generation must be positive but got: -1"),
+        Arguments.of(
+            ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst", -1L)),
+            "Destination generation must not be negative but got: -1"),
+        Arguments.of(validThenInvalid, "Move destination must be different from source"));
+  }
+
+  @ParameterizedTest
+  @MethodSource("moveObjectsInvalidEntryCases")
+  void moveObjects_invalidEntries_throwsIllegalArgumentExceptionBeforeAnyRpc(
+      Map<GcsItemId, GcsItemId> invalidMoves, String expectedMessage) {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    IllegalArgumentException e =
+        assertThrows(
+            IllegalArgumentException.class, () -> clientWithMock.moveObjects(invalidMoves));
+
+    assertThat(e).hasMessageThat().contains(expectedMessage);
+    verifyNoInteractions(mockStorage);
+  }
+
+  @Test
+  void moveObjects_sourceNotFound_throwsFileNotFoundException() {
+    Storage mockStorage = mock(Storage.class);
+    StorageException notFound = new StorageException(404, "Not Found");
+    when(mockStorage.moveBlob(any(Storage.MoveBlobRequest.class))).thenThrow(notFound);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    FileNotFoundException e =
+        assertThrows(
+            FileNotFoundException.class,
+            () ->
+                clientWithMock.moveObjects(
+                    ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst"))));
+
+    assertFileNotFoundException(e, moveObjectsId("src"));
+    assertThat(e).hasCauseThat().isSameInstanceAs(notFound);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {401, 403})
+  void moveObjects_accessDenied_throwsAccessDeniedException(int code) {
+    Storage mockStorage = mock(Storage.class);
+    StorageException denied = new StorageException(code, "Access denied");
+    when(mockStorage.moveBlob(any(Storage.MoveBlobRequest.class))).thenThrow(denied);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    AccessDeniedException e =
+        assertThrows(
+            AccessDeniedException.class,
+            () ->
+                clientWithMock.moveObjects(
+                    ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst"))));
+
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/src");
+    assertThat(e).hasCauseThat().isSameInstanceAs(denied);
+  }
+
+  @Test
+  void moveObjects_destinationExistsWithZeroDestinationGeneration_throwsFileAlreadyExists() {
+    Storage mockStorage = mock(Storage.class);
+    StorageException preconditionFailed = new StorageException(412, "Precondition Failed");
+    when(mockStorage.moveBlob(any(Storage.MoveBlobRequest.class))).thenThrow(preconditionFailed);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    FileAlreadyExistsException e =
+        assertThrows(
+            FileAlreadyExistsException.class,
+            () ->
+                clientWithMock.moveObjects(
+                    ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst", 0L))));
+
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/dst");
+    assertThat(e.getReason()).isEqualTo("Move destination already exists");
+    assertThat(e).hasCauseThat().isSameInstanceAs(preconditionFailed);
+  }
+
+  private static Stream<Arguments> moveObjectsOtherPreconditionCases() {
+    return Stream.of(
+        Arguments.of(moveObjectsId("src", 7L), moveObjectsId("dst", 0L)),
+        Arguments.of(moveObjectsId("src"), moveObjectsId("dst", 5L)));
+  }
+
+  @ParameterizedTest
+  @MethodSource("moveObjectsOtherPreconditionCases")
+  void moveObjects_otherPreconditionFailure_throwsIOException(GcsItemId srcId, GcsItemId dstId) {
+    Storage mockStorage = mock(Storage.class);
+    StorageException preconditionFailed = new StorageException(412, "Precondition Failed");
+    when(mockStorage.moveBlob(any(Storage.MoveBlobRequest.class))).thenThrow(preconditionFailed);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    IOException e =
+        assertThrows(
+            IOException.class, () -> clientWithMock.moveObjects(ImmutableMap.of(srcId, dstId)));
+
+    assertThat(e.getClass()).isEqualTo(IOException.class);
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to move gs://"
+                + TEST_BUCKET
+                + "/src to gs://"
+                + TEST_BUCKET
+                + "/dst: generation precondition failed");
+    assertThat(e).hasCauseThat().isSameInstanceAs(preconditionFailed);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {409, 500})
+  void moveObjects_otherStorageErrors_throwsIOException(int code) {
+    Storage mockStorage = mock(Storage.class);
+    StorageException storageError = new StorageException(code, "Storage failure");
+    when(mockStorage.moveBlob(any(Storage.MoveBlobRequest.class))).thenThrow(storageError);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                clientWithMock.moveObjects(
+                    ImmutableMap.of(moveObjectsId("src"), moveObjectsId("dst", 0L))));
+
+    assertThat(e.getClass()).isEqualTo(IOException.class);
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo("Failed to move gs://" + TEST_BUCKET + "/src to gs://" + TEST_BUCKET + "/dst");
+    assertThat(e).hasCauseThat().isSameInstanceAs(storageError);
+  }
+
+  @Test
+  void moveObjects_multipleFailures_throwsFirstAndAttachesSuppressedExceptions() {
+    Storage mockStorage = mock(Storage.class);
+    Storage.MoveBlobRequest req1 =
+        Storage.MoveBlobRequest.newBuilder()
+            .setSource(BlobId.of(TEST_BUCKET, "src1"))
+            .setTarget(BlobId.of(TEST_BUCKET, "dst1"))
+            .build();
+    Storage.MoveBlobRequest req3 =
+        Storage.MoveBlobRequest.newBuilder()
+            .setSource(BlobId.of(TEST_BUCKET, "src3"))
+            .setTarget(BlobId.of(TEST_BUCKET, "dst3"))
+            .build();
+    StorageException notFound = new StorageException(404, "Not Found");
+    StorageException serverError = new StorageException(500, "Internal Error");
+    when(mockStorage.moveBlob(eq(req1))).thenThrow(notFound);
+    when(mockStorage.moveBlob(eq(req3))).thenThrow(serverError);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    FileNotFoundException e =
+        assertThrows(
+            FileNotFoundException.class,
+            () ->
+                clientWithMock.moveObjects(
+                    ImmutableMap.of(
+                        moveObjectsId("src1"),
+                        moveObjectsId("dst1"),
+                        moveObjectsId("src2"),
+                        moveObjectsId("dst2"),
+                        moveObjectsId("src3"),
+                        moveObjectsId("dst3"))));
+
+    assertFileNotFoundException(e, moveObjectsId("src1"));
+    assertThat(e).hasCauseThat().isSameInstanceAs(notFound);
+    assertThat(e.getSuppressed()).hasLength(1);
+    assertThat(e.getSuppressed()[0]).isInstanceOf(IOException.class);
+    assertThat(e.getSuppressed()[0])
+        .hasMessageThat()
+        .isEqualTo("Failed to move gs://" + TEST_BUCKET + "/src3 to gs://" + TEST_BUCKET + "/dst3");
+    assertThat(e.getSuppressed()[0]).hasCauseThat().isSameInstanceAs(serverError);
+  }
+
+  @Test
+  void moveObjects_defaultInterfaceMethod_throwsUnsupportedOperationException() {
+    GcsClient minimalClient = mock(GcsClient.class, Answers.CALLS_REAL_METHODS);
+
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class,
+            () -> minimalClient.moveObjects(ImmutableMap.of()));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo("moveObjects is not implemented by " + minimalClient.getClass().getName());
+  }
+
+  private static GcsItemId moveObjectsId(String objectName) {
+    return GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(objectName).build();
+  }
+
+  private static GcsItemId moveObjectsId(String objectName, long generation) {
+    return GcsItemId.builder()
+        .setBucketName(TEST_BUCKET)
+        .setObjectName(objectName)
+        .setContentGeneration(generation)
+        .build();
   }
 
   @Test

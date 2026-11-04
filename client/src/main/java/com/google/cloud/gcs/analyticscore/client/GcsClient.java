@@ -18,8 +18,11 @@ package com.google.cloud.gcs.analyticscore.client;
 import com.google.common.annotations.VisibleForTesting;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.channels.WritableByteChannel;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.Map;
 import java.util.Optional;
 
 @VisibleForTesting
@@ -59,6 +62,37 @@ public interface GcsClient {
    * @throws UnsupportedOperationException if {@code itemId} does not denote a GCS object
    */
   GcsItemInfo getGcsItemInfo(GcsItemId itemId) throws IOException;
+
+  /**
+   * Moves each source object in {@code srcToDstItemIds} to its corresponding destination object
+   * within the same bucket concurrently using the configured batch thread pool ({@link
+   * GcsClientOptions#getBatchThreads()}).
+   *
+   * <p>Each move uses GCS {@code objects.move} ({@code Storage.moveBlob}, metadata-only, no byte
+   * copy). The source generation, if present, is sent as a source generation precondition ({@code
+   * ifSourceGenerationMatch}), and the destination generation, if present, is sent as a destination
+   * generation precondition ({@code ifGenerationMatch}, where {@code 0} means the destination must
+   * not exist). All entries are validated before any move request is sent. If one or more moves
+   * fail, waits for all queued moves to complete and throws the first {@link IOException} with
+   * subsequent failures attached as suppressed exceptions. An empty map is a no-op.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}.
+   *
+   * @param srcToDstItemIds map from source object ID to destination object ID
+   * @throws IllegalArgumentException if any key or value is null, is not a GCS object, names a
+   *     different bucket or the same object name as its pair, has a non-positive source generation,
+   *     or has a negative destination generation
+   * @throws FileNotFoundException if the primary failure is a missing source object
+   * @throws FileAlreadyExistsException if the primary failure is an existing destination guarded by
+   *     destination generation {@code 0} without a source generation
+   * @throws AccessDeniedException if the primary failure is a 401/403 permission error
+   * @throws InterruptedIOException if interrupted while awaiting batch completion
+   * @throws IOException if one or more moves fail
+   */
+  default void moveObjects(Map<GcsItemId, GcsItemId> srcToDstItemIds) throws IOException {
+    throw new UnsupportedOperationException(
+        "moveObjects is not implemented by " + getClass().getName());
+  }
 
   /**
    * Fetches bucket metadata.

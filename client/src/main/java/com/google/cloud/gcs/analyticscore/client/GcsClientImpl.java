@@ -76,6 +76,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import javax.annotation.Nullable;
@@ -277,6 +278,119 @@ class GcsClientImpl implements GcsClient {
     }
     throw new UnsupportedOperationException(
         String.format("Expected gcs object but got %s", itemId));
+  }
+
+  @Override
+  public void moveObjects(Map<GcsItemId, GcsItemId> srcToDstItemIds) throws IOException {
+    checkNotNull(srcToDstItemIds, "srcToDstItemIds must not be null");
+    for (Map.Entry<GcsItemId, GcsItemId> entry : srcToDstItemIds.entrySet()) {
+      GcsItemId srcId = entry.getKey();
+      GcsItemId dstId = entry.getValue();
+      checkArgument(
+          srcId != null && srcId.isGcsObject(), "Expected a GCS object srcId but got: %s", srcId);
+      checkArgument(
+          dstId != null && dstId.isGcsObject(), "Expected a GCS object dstId but got: %s", dstId);
+      checkArgument(
+          srcId.getBucketName().equals(dstId.getBucketName()),
+          "Cannot move objects across buckets: %s to %s",
+          srcId,
+          dstId);
+      checkArgument(
+          !srcId.getObjectName().get().equals(dstId.getObjectName().get()),
+          "Move destination must be different from source: %s",
+          srcId);
+      srcId
+          .getContentGeneration()
+          .ifPresent(
+              gen -> checkArgument(gen > 0, "Source generation must be positive but got: %s", gen));
+      dstId
+          .getContentGeneration()
+          .ifPresent(
+              gen ->
+                  checkArgument(
+                      gen >= 0, "Destination generation must not be negative but got: %s", gen));
+    }
+    if (srcToDstItemIds.isEmpty()) {
+      return;
+    }
+
+    BatchExecutor executor = new BatchExecutor(clientOptions.getBatchThreads());
+    try {
+      for (Map.Entry<GcsItemId, GcsItemId> entry : srcToDstItemIds.entrySet()) {
+        GcsItemId srcId = entry.getKey();
+        GcsItemId dstId = entry.getValue();
+        Storage.MoveBlobRequest request = buildMoveObjectsRequest(srcId, dstId);
+        executor.queue(
+            () -> {
+              try {
+                storage.moveBlob(request);
+                return null;
+              } catch (StorageException e) {
+                throw translateMoveObjectsException(e, srcId, dstId);
+              }
+            },
+            null);
+      }
+    } finally {
+      executor.shutdown();
+    }
+  }
+
+  private Storage.MoveBlobRequest buildMoveObjectsRequest(GcsItemId srcId, GcsItemId dstId) {
+    List<Storage.BlobSourceOption> sourceOptions = new ArrayList<>();
+    srcId
+        .getContentGeneration()
+        .map(Storage.BlobSourceOption::generationMatch)
+        .ifPresent(sourceOptions::add);
+    clientOptions
+        .getGcsReadOptions()
+        .getDecryptionKey()
+        .map(Storage.BlobSourceOption::decryptionKey)
+        .ifPresent(sourceOptions::add);
+    clientOptions
+        .getGcsWriteOptions()
+        .getUserProject()
+        .or(() -> clientOptions.getGcsReadOptions().getUserProjectId())
+        .map(Storage.BlobSourceOption::userProject)
+        .ifPresent(sourceOptions::add);
+    List<Storage.BlobTargetOption> targetOptions = new ArrayList<>();
+    dstId
+        .getContentGeneration()
+        .map(Storage.BlobTargetOption::generationMatch)
+        .ifPresent(targetOptions::add);
+    clientOptions
+        .getGcsWriteOptions()
+        .getEncryptionKey()
+        .map(Storage.BlobTargetOption::encryptionKey)
+        .ifPresent(targetOptions::add);
+
+    return Storage.MoveBlobRequest.newBuilder()
+        .setSource(BlobId.of(srcId.getBucketName(), srcId.getObjectName().get()))
+        .setTarget(BlobId.of(dstId.getBucketName(), dstId.getObjectName().get()))
+        .setSourceOptions(sourceOptions)
+        .setTargetOptions(targetOptions)
+        .build();
+  }
+
+  private static IOException translateMoveObjectsException(
+      StorageException e, GcsItemId srcId, GcsItemId dstId) {
+    String failureMessage =
+        String.format(
+            "Failed to move %s to %s", UriUtil.getStringPath(srcId), UriUtil.getStringPath(dstId));
+    switch (GcsExceptionUtil.getErrorType(e)) {
+      case NOT_FOUND:
+      case ACCESS_DENIED:
+        return GcsExceptionUtil.translateStorageException(e, srcId, failureMessage);
+      case PRECONDITION_FAILED:
+        if (srcId.getContentGeneration().isEmpty()
+            && dstId.getContentGeneration().equals(Optional.of(0L))) {
+          return GcsExceptionUtil.createFileAlreadyExistsException(
+              dstId, "Move destination already exists", e);
+        }
+        return new IOException(failureMessage + ": generation precondition failed", e);
+      default:
+        return new IOException(failureMessage, e);
+    }
   }
 
   @Override
