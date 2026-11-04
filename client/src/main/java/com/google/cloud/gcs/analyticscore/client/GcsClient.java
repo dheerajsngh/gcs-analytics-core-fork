@@ -20,6 +20,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.List;
 import java.util.Optional;
 
 @VisibleForTesting
@@ -107,6 +108,33 @@ public interface GcsClient {
    * @throws IOException if an I/O error occurs while creating the bucket
    */
   void createBucket(String bucketName, GcsCreateBucketOptions options) throws IOException;
+
+  /**
+   * Deletes the GCS objects in {@code itemIds} concurrently using the configured batch thread pool
+   * ({@link GcsClientOptions#getBatchThreads()}).
+   *
+   * <p>When an item ID specifies a positive content generation, deletion requires that generation
+   * to match ({@code ifGenerationMatch}). When an item ID has no content generation, its live
+   * generation is fetched first and then deleted with {@code ifGenerationMatch}, retrying
+   * generation precondition failures up to 4 times. Objects that do not exist ({@code 404} or
+   * {@code null}) are ignored (idempotent delete). If any deletion fails, waits for all queued
+   * operations to complete and throws the first {@link IOException} with subsequent failures
+   * attached as suppressed exceptions. An empty list is a no-op.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}.
+   *
+   * @param itemIds the GCS object IDs to delete
+   * @throws IllegalArgumentException if any element is {@code null}, does not denote a GCS object,
+   *     or specifies a non-positive content generation
+   * @throws java.nio.file.AccessDeniedException if the primary failure is a 401/403 permission
+   *     error
+   * @throws java.io.InterruptedIOException if interrupted while awaiting batch completion
+   * @throws IOException if one or more deletions fail
+   */
+  default void deleteObjects(List<GcsItemId> itemIds) throws IOException {
+    throw new UnsupportedOperationException(
+        "deleteObjects is not implemented by " + getClass().getName());
+  }
 
   /**
    * Creates a 0-byte empty object (such as a flat-namespace directory marker) with default write

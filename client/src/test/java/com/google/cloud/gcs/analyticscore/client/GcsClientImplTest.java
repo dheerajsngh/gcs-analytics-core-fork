@@ -125,6 +125,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 
@@ -802,6 +803,431 @@ class GcsClientImplTest {
             IOException.class, () -> localGcsClient.getBucketProperties(TEST_ERROR_BUCKET));
 
     assertThat(e).hasMessageThat().contains("Unable to access bucket: " + TEST_ERROR_BUCKET);
+  }
+
+  @Test
+  void deleteObjects_emptyList_doesNotInteractWithStorage() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    clientWithMock.deleteObjects(ImmutableList.of());
+
+    verify(mockStorage, never()).get(any(BlobId.class), any(Storage.BlobGetOption[].class));
+    verify(mockStorage, never()).delete(any(BlobId.class), any(Storage.BlobSourceOption[].class));
+  }
+
+  @Test
+  void deleteObjects_nullList_throwsNullPointerException() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    NullPointerException e =
+        assertThrows(NullPointerException.class, () -> clientWithMock.deleteObjects(null));
+
+    assertThat(e).hasMessageThat().isEqualTo("itemIds must not be null");
+    verify(mockStorage, never()).get(any(BlobId.class), any(Storage.BlobGetOption[].class));
+    verify(mockStorage, never()).delete(any(BlobId.class), any(Storage.BlobSourceOption[].class));
+  }
+
+  private static Stream<Arguments> invalidDeleteObjectsItemIds() {
+    return Stream.of(
+        Arguments.of(Arrays.asList(TEST_ITEM_ID, null), "Expected GCS object itemIds only"),
+        Arguments.of(ImmutableList.of(GcsItemId.ROOT), "Expected GCS object itemIds only"),
+        Arguments.of(
+            ImmutableList.of(GcsItemId.builder().setBucketName(TEST_BUCKET).build()),
+            "Expected GCS object itemIds only"),
+        Arguments.of(
+            ImmutableList.of(
+                GcsItemId.builder()
+                    .setBucketName(TEST_BUCKET)
+                    .setObjectName(TEST_OBJECT)
+                    .setContentGeneration(0L)
+                    .build()),
+            "Content generation must be positive"),
+        Arguments.of(
+            ImmutableList.of(
+                GcsItemId.builder()
+                    .setBucketName(TEST_BUCKET)
+                    .setObjectName(TEST_OBJECT)
+                    .setContentGeneration(-1L)
+                    .build()),
+            "Content generation must be positive"));
+  }
+
+  @ParameterizedTest
+  @MethodSource("invalidDeleteObjectsItemIds")
+  void deleteObjects_invalidItemId_throwsIllegalArgumentExceptionBeforeAnyRpc(
+      List<GcsItemId> itemIds, String expectedMessageSubstring) {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+
+    IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () -> clientWithMock.deleteObjects(itemIds));
+
+    assertThat(e).hasMessageThat().contains(expectedMessageSubstring);
+    verify(mockStorage, never()).get(any(BlobId.class), any(Storage.BlobGetOption[].class));
+    verify(mockStorage, never()).delete(any(BlobId.class), any(Storage.BlobSourceOption[].class));
+  }
+
+  @Test
+  void deleteObjects_withExplicitGeneration_deletesDirectlyWithoutGet() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    GcsItemId itemIdWithGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_OBJECT)
+            .setContentGeneration(TEST_CONTENT_GENERATION)
+            .build();
+    BlobId expectedBlobId = BlobId.of(TEST_BUCKET, TEST_OBJECT);
+    when(mockStorage.delete(
+            eq(expectedBlobId),
+            eq(Storage.BlobSourceOption.generationMatch(TEST_CONTENT_GENERATION))))
+        .thenReturn(true);
+
+    clientWithMock.deleteObjects(ImmutableList.of(itemIdWithGen));
+
+    verify(mockStorage, never()).get(any(BlobId.class), any(Storage.BlobGetOption[].class));
+    verify(mockStorage)
+        .delete(expectedBlobId, Storage.BlobSourceOption.generationMatch(TEST_CONTENT_GENERATION));
+  }
+
+  @Test
+  void deleteObjects_withUserProjectFromWriteOptions_forwardsUserProjectToGetAndDelete()
+      throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientOptions clientOptions =
+        GcsClientOptions.builder()
+            .setProjectId(TEST_PROJECT)
+            .setGcsWriteOptions(GcsWriteOptions.builder().setUserProject("write-project").build())
+            .setGcsReadOptions(GcsReadOptions.builder().setUserProjectId("read-project").build())
+            .build();
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage, clientOptions);
+    Blob mockBlob = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    when(mockBlob.getGeneration()).thenReturn(TEST_CONTENT_GENERATION);
+    BlobId expectedBlobId = BlobId.of(TEST_BUCKET, TEST_OBJECT);
+    when(mockStorage.get(
+            eq(expectedBlobId),
+            eq(Storage.BlobGetOption.fields(Storage.BlobField.GENERATION)),
+            eq(Storage.BlobGetOption.userProject("write-project"))))
+        .thenReturn(mockBlob);
+    when(mockStorage.delete(
+            eq(expectedBlobId),
+            eq(Storage.BlobSourceOption.generationMatch(TEST_CONTENT_GENERATION)),
+            eq(Storage.BlobSourceOption.userProject("write-project"))))
+        .thenReturn(true);
+
+    clientWithMock.deleteObjects(ImmutableList.of(TEST_ITEM_ID));
+
+    verify(mockStorage)
+        .get(
+            expectedBlobId,
+            Storage.BlobGetOption.fields(Storage.BlobField.GENERATION),
+            Storage.BlobGetOption.userProject("write-project"));
+    verify(mockStorage)
+        .delete(
+            expectedBlobId,
+            Storage.BlobSourceOption.generationMatch(TEST_CONTENT_GENERATION),
+            Storage.BlobSourceOption.userProject("write-project"));
+  }
+
+  @Test
+  void deleteObjects_withUserProjectFromReadOptionsFallback_forwardsUserProjectToGetAndDelete()
+      throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientOptions clientOptions =
+        GcsClientOptions.builder()
+            .setProjectId(TEST_PROJECT)
+            .setGcsReadOptions(GcsReadOptions.builder().setUserProjectId("read-project").build())
+            .build();
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage, clientOptions);
+    GcsItemId itemIdWithGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("explicit-gen-obj")
+            .setContentGeneration(TEST_CONTENT_GENERATION)
+            .build();
+    Blob mockBlob = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    when(mockBlob.getGeneration()).thenReturn(77L);
+    when(mockStorage.get(
+            eq(BlobId.of(TEST_BUCKET, TEST_OBJECT)),
+            eq(Storage.BlobGetOption.fields(Storage.BlobField.GENERATION)),
+            eq(Storage.BlobGetOption.userProject("read-project"))))
+        .thenReturn(mockBlob);
+    when(mockStorage.delete(any(BlobId.class), any(Storage.BlobSourceOption[].class)))
+        .thenReturn(true);
+
+    clientWithMock.deleteObjects(ImmutableList.of(TEST_ITEM_ID, itemIdWithGen));
+
+    verify(mockStorage)
+        .get(
+            BlobId.of(TEST_BUCKET, TEST_OBJECT),
+            Storage.BlobGetOption.fields(Storage.BlobField.GENERATION),
+            Storage.BlobGetOption.userProject("read-project"));
+    verify(mockStorage)
+        .delete(
+            BlobId.of(TEST_BUCKET, TEST_OBJECT),
+            Storage.BlobSourceOption.generationMatch(77L),
+            Storage.BlobSourceOption.userProject("read-project"));
+    verify(mockStorage)
+        .delete(
+            BlobId.of(TEST_BUCKET, "explicit-gen-obj"),
+            Storage.BlobSourceOption.generationMatch(TEST_CONTENT_GENERATION),
+            Storage.BlobSourceOption.userProject("read-project"));
+  }
+
+  @Test
+  void deleteObjects_withoutGenerationWhenObjectMissingOnGet_skipsDeleteAndSucceeds()
+      throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    GcsItemId nullBlobItem =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("null-blob").build();
+    GcsItemId nullGenItem =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("null-gen").build();
+    GcsItemId notFoundItem =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("not-found").build();
+    Blob blobWithNullGen = createMockBlob(TEST_BUCKET, "null-gen");
+    when(blobWithNullGen.getGeneration()).thenReturn(null);
+    when(mockStorage.get(
+            eq(BlobId.of(TEST_BUCKET, "null-blob")), any(Storage.BlobGetOption[].class)))
+        .thenReturn(null);
+    when(mockStorage.get(
+            eq(BlobId.of(TEST_BUCKET, "null-gen")), any(Storage.BlobGetOption[].class)))
+        .thenReturn(blobWithNullGen);
+    when(mockStorage.get(
+            eq(BlobId.of(TEST_BUCKET, "not-found")), any(Storage.BlobGetOption[].class)))
+        .thenThrow(new StorageException(404, "Not Found"));
+
+    clientWithMock.deleteObjects(ImmutableList.of(nullBlobItem, nullGenItem, notFoundItem));
+
+    verify(mockStorage, never()).delete(any(BlobId.class), any(Storage.BlobSourceOption[].class));
+  }
+
+  @Test
+  void deleteObjects_whenDeleteReturnsFalseOrThrows404_succeeds() throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    GcsItemId falseDeleteItem =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("false-delete")
+            .setContentGeneration(10L)
+            .build();
+    GcsItemId notFoundDeleteItem =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("404-delete")
+            .setContentGeneration(20L)
+            .build();
+    when(mockStorage.delete(
+            eq(BlobId.of(TEST_BUCKET, "false-delete")), any(Storage.BlobSourceOption[].class)))
+        .thenReturn(false);
+    when(mockStorage.delete(
+            eq(BlobId.of(TEST_BUCKET, "404-delete")), any(Storage.BlobSourceOption[].class)))
+        .thenThrow(new StorageException(404, "Not Found"));
+
+    clientWithMock.deleteObjects(ImmutableList.of(falseDeleteItem, notFoundDeleteItem));
+
+    verify(mockStorage)
+        .delete(
+            BlobId.of(TEST_BUCKET, "false-delete"), Storage.BlobSourceOption.generationMatch(10L));
+    verify(mockStorage)
+        .delete(
+            BlobId.of(TEST_BUCKET, "404-delete"), Storage.BlobSourceOption.generationMatch(20L));
+  }
+
+  @Test
+  void deleteObjects_withoutGenerationPreconditionFailedFourTimesThenSucceeds_retriesAndSucceeds()
+      throws IOException {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    BlobId blobId = BlobId.of(TEST_BUCKET, TEST_OBJECT);
+    Blob blobGen1 = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    Blob blobGen2 = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    Blob blobGen3 = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    Blob blobGen4 = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    Blob blobGen5 = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    when(blobGen1.getGeneration()).thenReturn(1L);
+    when(blobGen2.getGeneration()).thenReturn(2L);
+    when(blobGen3.getGeneration()).thenReturn(3L);
+    when(blobGen4.getGeneration()).thenReturn(4L);
+    when(blobGen5.getGeneration()).thenReturn(5L);
+    when(mockStorage.get(eq(blobId), any(Storage.BlobGetOption[].class)))
+        .thenReturn(blobGen1, blobGen2, blobGen3, blobGen4, blobGen5);
+    StorageException e412 = new StorageException(412, "Precondition Failed");
+    when(mockStorage.delete(eq(blobId), any(Storage.BlobSourceOption[].class)))
+        .thenThrow(e412)
+        .thenThrow(e412)
+        .thenThrow(e412)
+        .thenThrow(e412)
+        .thenReturn(true);
+
+    clientWithMock.deleteObjects(ImmutableList.of(TEST_ITEM_ID));
+
+    verify(mockStorage, times(5)).get(eq(blobId), any(Storage.BlobGetOption[].class));
+    verify(mockStorage).delete(blobId, Storage.BlobSourceOption.generationMatch(1L));
+    verify(mockStorage).delete(blobId, Storage.BlobSourceOption.generationMatch(2L));
+    verify(mockStorage).delete(blobId, Storage.BlobSourceOption.generationMatch(3L));
+    verify(mockStorage).delete(blobId, Storage.BlobSourceOption.generationMatch(4L));
+    verify(mockStorage).delete(blobId, Storage.BlobSourceOption.generationMatch(5L));
+  }
+
+  @Test
+  void deleteObjects_withoutGenerationPreconditionFailedExceedsMaxRetries_throwsIOException() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    BlobId blobId = BlobId.of(TEST_BUCKET, TEST_OBJECT);
+    Blob mockBlob = createMockBlob(TEST_BUCKET, TEST_OBJECT);
+    when(mockBlob.getGeneration()).thenReturn(99L);
+    when(mockStorage.get(eq(blobId), any(Storage.BlobGetOption[].class))).thenReturn(mockBlob);
+    StorageException e412 = new StorageException(412, "Precondition Failed");
+    when(mockStorage.delete(eq(blobId), any(Storage.BlobSourceOption[].class))).thenThrow(e412);
+
+    IOException e =
+        assertThrows(
+            IOException.class, () -> clientWithMock.deleteObjects(ImmutableList.of(TEST_ITEM_ID)));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Generation precondition failed while deleting gs://"
+                + TEST_BUCKET
+                + "/"
+                + TEST_OBJECT
+                + " at generation 99");
+    assertThat(e).hasCauseThat().isSameInstanceAs(e412);
+    verify(mockStorage, times(5)).get(eq(blobId), any(Storage.BlobGetOption[].class));
+    verify(mockStorage, times(5)).delete(eq(blobId), any(Storage.BlobSourceOption[].class));
+  }
+
+  @Test
+  void deleteObjects_withExplicitGenerationPreconditionFailed_throwsImmediatelyWithoutRetry() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    GcsItemId itemIdWithGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_OBJECT)
+            .setContentGeneration(TEST_CONTENT_GENERATION)
+            .build();
+    BlobId blobId = BlobId.of(TEST_BUCKET, TEST_OBJECT);
+    StorageException e412 = new StorageException(412, "Precondition Failed");
+    when(mockStorage.delete(eq(blobId), any(Storage.BlobSourceOption[].class))).thenThrow(e412);
+
+    IOException e =
+        assertThrows(
+            IOException.class, () -> clientWithMock.deleteObjects(ImmutableList.of(itemIdWithGen)));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Generation precondition failed while deleting gs://"
+                + TEST_BUCKET
+                + "/"
+                + TEST_OBJECT
+                + " at generation "
+                + TEST_CONTENT_GENERATION);
+    assertThat(e).hasCauseThat().isSameInstanceAs(e412);
+    verify(mockStorage, never()).get(any(BlobId.class), any(Storage.BlobGetOption[].class));
+    verify(mockStorage, times(1)).delete(eq(blobId), any(Storage.BlobSourceOption[].class));
+  }
+
+  @Test
+  void deleteObjects_deleteThrows403_throwsAccessDeniedException() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    GcsItemId itemIdWithGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_OBJECT)
+            .setContentGeneration(TEST_CONTENT_GENERATION)
+            .build();
+    StorageException e403 = new StorageException(403, "Forbidden");
+    when(mockStorage.delete(
+            eq(BlobId.of(TEST_BUCKET, TEST_OBJECT)), any(Storage.BlobSourceOption[].class)))
+        .thenThrow(e403);
+
+    AccessDeniedException e =
+        assertThrows(
+            AccessDeniedException.class,
+            () -> clientWithMock.deleteObjects(ImmutableList.of(itemIdWithGen)));
+
+    assertThat(e.getFile())
+        .isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_OBJECT + "#" + TEST_CONTENT_GENERATION);
+    assertThat(e).hasCauseThat().isSameInstanceAs(e403);
+  }
+
+  @Test
+  void deleteObjects_stage1GetThrows500_throwsIOException() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage);
+    StorageException e500 = new StorageException(500, "Internal Server Error");
+    when(mockStorage.get(
+            eq(BlobId.of(TEST_BUCKET, TEST_OBJECT)), any(Storage.BlobGetOption[].class)))
+        .thenThrow(e500);
+
+    IOException e =
+        assertThrows(
+            IOException.class, () -> clientWithMock.deleteObjects(ImmutableList.of(TEST_ITEM_ID)));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Failed to fetch generation for deletion of gs://" + TEST_BUCKET + "/" + TEST_OBJECT);
+    assertThat(e).hasCauseThat().isSameInstanceAs(e500);
+  }
+
+  @Test
+  void deleteObjects_multipleFailures_throwsFirstAndAttachesSuppressed() {
+    Storage mockStorage = mock(Storage.class);
+    GcsClientOptions singleThreadOptions =
+        GcsClientOptions.builder().setProjectId(TEST_PROJECT).setBatchThreads(0).build();
+    GcsClientImpl clientWithMock = createClientWithMockStorage(mockStorage, singleThreadOptions);
+    GcsItemId item1 =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("obj1")
+            .setContentGeneration(1L)
+            .build();
+    GcsItemId item2 =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("obj2")
+            .setContentGeneration(2L)
+            .build();
+    StorageException error1 = new StorageException(500, "Error 1");
+    StorageException error2 = new StorageException(500, "Error 2");
+    when(mockStorage.delete(
+            eq(BlobId.of(TEST_BUCKET, "obj1")), any(Storage.BlobSourceOption[].class)))
+        .thenThrow(error1);
+    when(mockStorage.delete(
+            eq(BlobId.of(TEST_BUCKET, "obj2")), any(Storage.BlobSourceOption[].class)))
+        .thenThrow(error2);
+
+    IOException e =
+        assertThrows(
+            IOException.class, () -> clientWithMock.deleteObjects(ImmutableList.of(item1, item2)));
+
+    assertThat(e).hasMessageThat().isEqualTo("Failed to delete gs://" + TEST_BUCKET + "/obj1");
+    assertThat(e).hasCauseThat().isSameInstanceAs(error1);
+    assertThat(e.getSuppressed()).hasLength(1);
+    assertThat(e.getSuppressed()[0])
+        .hasMessageThat()
+        .isEqualTo("Failed to delete gs://" + TEST_BUCKET + "/obj2");
+    assertThat(e.getSuppressed()[0]).hasCauseThat().isSameInstanceAs(error2);
+  }
+
+  @Test
+  void deleteObjects_defaultMethod_throwsUnsupportedOperationException() {
+    GcsClient unimplementedClient = mock(GcsClient.class, Answers.CALLS_REAL_METHODS);
+
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class,
+            () -> unimplementedClient.deleteObjects(ImmutableList.of(TEST_ITEM_ID)));
+
+    assertThat(e).hasMessageThat().contains("deleteObjects is not implemented by ");
   }
 
   private GcsClientImpl createClientWithMockStorage(Storage mockStorage) {

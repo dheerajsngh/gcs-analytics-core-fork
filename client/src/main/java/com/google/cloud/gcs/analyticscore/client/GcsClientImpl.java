@@ -511,6 +511,120 @@ class GcsClientImpl implements GcsClient {
     }
   }
 
+  private static final int DELETE_OBJECTS_MAX_PRECONDITION_RETRIES = 4;
+
+  @Override
+  public void deleteObjects(List<GcsItemId> itemIds) throws IOException {
+    checkNotNull(itemIds, "itemIds must not be null");
+    for (GcsItemId itemId : itemIds) {
+      checkArgument(
+          itemId != null && itemId.isGcsObject(),
+          "Expected GCS object itemIds only, got: %s",
+          itemId);
+      itemId
+          .getContentGeneration()
+          .ifPresent(
+              gen ->
+                  checkArgument(
+                      gen > 0, "Content generation must be positive, got: %s for %s", gen, itemId));
+    }
+    if (itemIds.isEmpty()) {
+      return;
+    }
+    BatchExecutor executor = new BatchExecutor(clientOptions.getBatchThreads());
+    try {
+      for (GcsItemId itemId : itemIds) {
+        queueDeleteObject(itemId, executor, 0);
+      }
+    } finally {
+      executor.shutdown();
+    }
+  }
+
+  private void queueDeleteObject(GcsItemId itemId, BatchExecutor executor, int attempt) {
+    if (itemId.getContentGeneration().isPresent()) {
+      queueDeleteObjectAtGeneration(itemId, itemId.getContentGeneration().get(), executor, attempt);
+      return;
+    }
+    executor.queue(
+        () -> {
+          BlobId blobId = BlobId.of(itemId.getBucketName(), itemId.getObjectName().get());
+          Blob blob;
+          try {
+            blob = storage.get(blobId, deleteObjectsGetOptions());
+          } catch (StorageException e) {
+            if (GcsExceptionUtil.getErrorType(e) == GcsExceptionUtil.ErrorType.NOT_FOUND) {
+              return null;
+            }
+            throw GcsExceptionUtil.translateStorageException(
+                e,
+                itemId,
+                "Failed to fetch generation for deletion of " + UriUtil.getStringPath(itemId));
+          }
+          if (blob == null || blob.getGeneration() == null) {
+            return null;
+          }
+          queueDeleteObjectAtGeneration(itemId, blob.getGeneration(), executor, attempt);
+          return null;
+        },
+        null);
+  }
+
+  private void queueDeleteObjectAtGeneration(
+      GcsItemId itemId, long generation, BatchExecutor executor, int attempt) {
+    executor.queue(
+        () -> {
+          BlobId blobId = BlobId.of(itemId.getBucketName(), itemId.getObjectName().get());
+          try {
+            storage.delete(blobId, deleteObjectsSourceOptions(generation));
+            return null;
+          } catch (StorageException e) {
+            GcsExceptionUtil.ErrorType errorType = GcsExceptionUtil.getErrorType(e);
+            if (errorType == GcsExceptionUtil.ErrorType.NOT_FOUND) {
+              return null;
+            }
+            if (errorType == GcsExceptionUtil.ErrorType.PRECONDITION_FAILED) {
+              if (itemId.getContentGeneration().isEmpty()
+                  && attempt < DELETE_OBJECTS_MAX_PRECONDITION_RETRIES) {
+                queueDeleteObject(itemId, executor, attempt + 1);
+                return null;
+              }
+              throw new IOException(
+                  String.format(
+                      "Generation precondition failed while deleting %s at generation %d",
+                      UriUtil.getStringPath(itemId), generation),
+                  e);
+            }
+            throw GcsExceptionUtil.translateStorageException(
+                e, itemId, "Failed to delete " + UriUtil.getStringPath(itemId));
+          }
+        },
+        null);
+  }
+
+  private Optional<String> deleteObjectsUserProject() {
+    return clientOptions
+        .getGcsWriteOptions()
+        .getUserProject()
+        .or(() -> clientOptions.getGcsReadOptions().getUserProjectId());
+  }
+
+  private Storage.BlobGetOption[] deleteObjectsGetOptions() {
+    List<Storage.BlobGetOption> getOptions = new ArrayList<>(2);
+    getOptions.add(Storage.BlobGetOption.fields(BlobField.GENERATION));
+    deleteObjectsUserProject().map(Storage.BlobGetOption::userProject).ifPresent(getOptions::add);
+    return getOptions.toArray(new Storage.BlobGetOption[0]);
+  }
+
+  private Storage.BlobSourceOption[] deleteObjectsSourceOptions(long generation) {
+    List<Storage.BlobSourceOption> sourceOptions = new ArrayList<>(2);
+    sourceOptions.add(Storage.BlobSourceOption.generationMatch(generation));
+    deleteObjectsUserProject()
+        .map(Storage.BlobSourceOption::userProject)
+        .ifPresent(sourceOptions::add);
+    return sourceOptions.toArray(new Storage.BlobSourceOption[0]);
+  }
+
   @Override
   public void close() {
     try {
