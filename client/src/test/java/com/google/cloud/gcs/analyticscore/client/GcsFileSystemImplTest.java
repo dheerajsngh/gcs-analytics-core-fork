@@ -72,6 +72,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1307,6 +1308,628 @@ class GcsFileSystemImplTest {
 
     assertThat(getRegisteredTelemetryListeners(fileSystem.getTelemetry())).isEmpty();
     assertThat(getRegisteredTelemetryListeners(fileSystem.getTelemetry())).doesNotContain(reporter);
+  }
+
+  @Test
+  void listFileInfo_existingObject_returnsOnlyThatObject() throws IOException {
+    GcsItemId itemId = listItemId("data/file.parquet");
+    GcsItemInfo objectInfo = listObjectInfo("data/file.parquet");
+    when(mockClient.getGcsItemInfo(itemId)).thenReturn(objectInfo);
+    lenient()
+        .when(mockClient.listObjectsPage(any(), any()))
+        .thenReturn(listPage(List.of(listObjectInfo("data/file.parquet/child")), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(itemId);
+
+    assertThat(listed).hasSize(1);
+    assertThat(listed.get(0).getItemInfo()).isSameInstanceAs(objectInfo);
+    assertThat(listed.get(0).getUri().toString())
+        .isEqualTo("gs://" + TEST_BUCKET + "/data/file.parquet");
+  }
+
+  @Test
+  void listFileInfo_lazyExecution_existingObject_doesNotListDirectory() throws IOException {
+    GcsFileSystemOptions lazyOptions =
+        testOptionsBuilder().setMetadataLookupParallelEnabled(false).build();
+    GcsItemId itemId = listItemId("data");
+    when(mockClient.getGcsItemInfo(itemId)).thenReturn(listObjectInfo("data"));
+
+    try (GcsFileSystemImpl lazyFs = new GcsFileSystemImpl(mockClient, lazyOptions)) {
+      lazyFs.listFileInfo(itemId);
+    }
+
+    verify(mockClient, never()).listObjectsPage(any(), any());
+    verify(mockClient, never()).getBucketProperties(any());
+  }
+
+  @Test
+  void listFileInfo_parallelExecution_existingObject_interruptsBackgroundListing()
+      throws Exception {
+    GcsItemId itemId = listItemId("data");
+    CountDownLatch listingStarted = new CountDownLatch(1);
+    CountDownLatch listingInterrupted = new CountDownLatch(1);
+    when(mockClient.listObjectsPage(eq(itemId.toDirectoryId()), any()))
+        .thenAnswer(
+            invocation -> {
+              listingStarted.countDown();
+              try {
+                // Blocks until the listing is cancelled.
+                new CountDownLatch(1).await();
+              } catch (InterruptedException e) {
+                listingInterrupted.countDown();
+              }
+              throw new InterruptedIOException("listing interrupted");
+            });
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenAnswer(
+            invocation -> {
+              assertThat(listingStarted.await(5, TimeUnit.SECONDS)).isTrue();
+              return listObjectInfo("data");
+            });
+
+    gcsFileSystem.listFileInfo(itemId);
+
+    assertThat(listingInterrupted.await(5, TimeUnit.SECONDS)).isTrue();
+  }
+
+  @Test
+  void listFileInfo_lazyExecution_objectLookupAccessDenied_rethrowsWithoutListing()
+      throws IOException {
+    GcsFileSystemOptions lazyOptions =
+        testOptionsBuilder().setMetadataLookupParallelEnabled(false).build();
+    GcsItemId itemId = listItemId("data");
+    AccessDeniedException denied = new AccessDeniedException("gs://" + TEST_BUCKET + "/data");
+    when(mockClient.getGcsItemInfo(itemId)).thenThrow(denied);
+
+    try (GcsFileSystemImpl lazyFs = new GcsFileSystemImpl(mockClient, lazyOptions)) {
+      AccessDeniedException thrown =
+          assertThrows(AccessDeniedException.class, () -> lazyFs.listFileInfo(itemId));
+
+      assertThat(thrown).isSameInstanceAs(denied);
+    }
+    verify(mockClient, never()).listObjectsPage(any(), any());
+  }
+
+  @Test
+  void listFileInfo_objectNotFound_listsDirectoryWithSameName() throws IOException {
+    GcsItemId itemId = listItemId("data");
+    GcsItemInfo child = listObjectInfo("data/part-0.parquet");
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenThrow(GcsExceptionUtil.createFileNotFoundException(itemId));
+    when(mockClient.listObjectsPage(itemId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(child), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(itemId);
+
+    assertThat(listedItemInfos(listed)).containsExactly(child);
+  }
+
+  @Test
+  void listFileInfo_lazyExecution_objectNotFound_listsDirectoryWithSameName() throws IOException {
+    GcsFileSystemOptions lazyOptions =
+        testOptionsBuilder().setMetadataLookupParallelEnabled(false).build();
+    GcsItemId itemId = listItemId("data");
+    GcsItemInfo child = listObjectInfo("data/part-0.parquet");
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenThrow(GcsExceptionUtil.createFileNotFoundException(itemId));
+    when(mockClient.listObjectsPage(itemId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(child), List.of()));
+
+    try (GcsFileSystemImpl lazyFs = new GcsFileSystemImpl(mockClient, lazyOptions)) {
+      List<GcsFileInfo> listed = lazyFs.listFileInfo(itemId);
+
+      assertThat(listedItemInfos(listed)).containsExactly(child);
+    }
+  }
+
+  @Test
+  void listFileInfo_directoryIdWithContentGeneration_ignoresGeneration() throws IOException {
+    GcsItemId dirIdWithGeneration =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("data/")
+            .setContentGeneration(5L)
+            .build();
+    GcsItemInfo child = listObjectInfo("data/part-0.parquet");
+    when(mockClient.listObjectsPage(listItemId("data/"), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(child), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirIdWithGeneration);
+
+    assertThat(listedItemInfos(listed)).containsExactly(child);
+  }
+
+  @Test
+  void listFileInfo_callingThreadInterrupted_throwsInterruptedIOExceptionWithoutListing()
+      throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    Thread.currentThread().interrupt();
+    try {
+      assertThrows(InterruptedIOException.class, () -> gcsFileSystem.listFileInfo(dirId));
+    } finally {
+      // Clear the flag so that it does not leak into other tests.
+      Thread.interrupted();
+    }
+
+    verify(mockClient, never()).listObjectsPage(any(), any());
+  }
+
+  @Test
+  void listFileInfo_objectNotFoundAndListingAccessDenied_throwsAccessDeniedException()
+      throws IOException {
+    GcsItemId itemId = listItemId("data");
+    AccessDeniedException denied = new AccessDeniedException("gs://" + TEST_BUCKET + "/data/");
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenThrow(GcsExceptionUtil.createFileNotFoundException(itemId));
+    when(mockClient.listObjectsPage(itemId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenThrow(denied);
+
+    AccessDeniedException thrown =
+        assertThrows(AccessDeniedException.class, () -> gcsFileSystem.listFileInfo(itemId));
+
+    assertThat(thrown).isSameInstanceAs(denied);
+  }
+
+  @Test
+  void listFileInfo_directoryPath_listsOnCallingThreadWithoutObjectLookup() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    AtomicReference<Thread> listingThread = new AtomicReference<>();
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenAnswer(
+            invocation -> {
+              listingThread.set(Thread.currentThread());
+              return listPage(List.of(listObjectInfo("data/part-0.parquet")), List.of());
+            });
+
+    gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listingThread.get()).isSameInstanceAs(Thread.currentThread());
+    verify(mockClient, never()).getGcsItemInfo(any());
+  }
+
+  @Test
+  void listFileInfo_directoryWithObjectsAndPrefixes_returnsObjectsAndInferredDirectories()
+      throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    GcsItemInfo file = listObjectInfo("data/file.txt");
+    GcsItemInfo childPlaceholder =
+        GcsItemInfo.createPlaceholderDirectory(listItemId("data/placeholder/"));
+    GcsItemId implicitDirId = listItemId("data/implicit/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(file, childPlaceholder), List.of(implicitDirId)));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listedItemInfos(listed))
+        .containsExactly(
+            file, childPlaceholder, GcsItemInfo.createInferredDirectory(implicitDirId));
+  }
+
+  @Test
+  void listFileInfo_inferredDirectory_hasUriWithTrailingSlash() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(), List.of(listItemId("data/implicit/"))));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listedUris(listed)).containsExactly("gs://" + TEST_BUCKET + "/data/implicit/");
+  }
+
+  @Test
+  void listFileInfo_children_sortedByUriLengthThenLexicographically() throws IOException {
+    GcsItemId dirId = listItemId("dir/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            listPage(
+                List.of(
+                    listObjectInfo("dir/aa"),
+                    listObjectInfo("dir/aaa.txt"),
+                    listObjectInfo("dir/b")),
+                List.of(listItemId("dir/a/"))));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listedUris(listed))
+        .containsExactly(
+            "gs://" + TEST_BUCKET + "/dir/b",
+            "gs://" + TEST_BUCKET + "/dir/a/",
+            "gs://" + TEST_BUCKET + "/dir/aa",
+            "gs://" + TEST_BUCKET + "/dir/aaa.txt")
+        .inOrder();
+  }
+
+  @Test
+  void listFileInfo_multiplePages_returnsChildrenOfEveryPage() throws IOException {
+    GcsItemId dirId = listItemId("dir/");
+    GcsItemInfo first = listObjectInfo("dir/a");
+    GcsItemInfo second = listObjectInfo("dir/b");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setItems(List.of(first))
+                .setNextPageToken("token-1")
+                .build());
+    when(mockClient.listObjectsPage(
+            dirId, GcsListOptions.LIST_DIRECTORY.toBuilder().setPageToken("token-1").build()))
+        .thenReturn(listPage(List.of(second), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listedItemInfos(listed)).containsExactly(first, second).inOrder();
+  }
+
+  @Test
+  void listFileInfo_emptyDirectoryWithPlaceholder_returnsEmptyList() throws IOException {
+    GcsItemId dirId = listItemId("empty/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixObject(GcsItemInfo.createPlaceholderDirectory(dirId))
+                .build());
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThat(listed).isEmpty();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"missing", "missing/"})
+  void listFileInfo_neitherObjectNorDirectoryExists_throwsFileNotFoundExceptionNamingPath(
+      String objectName) throws IOException {
+    GcsItemId itemId = listItemId(objectName);
+    lenient()
+        .when(mockClient.getGcsItemInfo(itemId))
+        .thenThrow(GcsExceptionUtil.createFileNotFoundException(itemId));
+    when(mockClient.listObjectsPage(itemId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(), List.of()));
+
+    FileNotFoundException e =
+        assertThrows(FileNotFoundException.class, () -> gcsFileSystem.listFileInfo(itemId));
+
+    assertThat(e)
+        .hasMessageThat()
+        .isEqualTo(
+            "Location does not exist or generation not found: gs://"
+                + TEST_BUCKET
+                + "/"
+                + objectName);
+  }
+
+  @Test
+  void listFileInfo_bucket_listsTopLevelWithoutObjectLookup() throws IOException {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemInfo file = listObjectInfo("file.txt");
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(file), List.of(listItemId("dir/"))));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(bucketId);
+
+    assertThat(listedUris(listed))
+        .containsExactly("gs://" + TEST_BUCKET + "/dir/", "gs://" + TEST_BUCKET + "/file.txt")
+        .inOrder();
+    verify(mockClient, never()).getGcsItemInfo(any());
+  }
+
+  @Test
+  void listFileInfo_emptyBucket_returnsEmptyList() throws IOException {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(bucketId);
+
+    assertThat(listed).isEmpty();
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+    "true, gs://missing-bucket",
+    "true, gs://missing-bucket/dir/",
+    "true, gs://missing-bucket/dir",
+    "false, gs://missing-bucket",
+    "false, gs://missing-bucket/dir/",
+    "false, gs://missing-bucket/dir"
+  })
+  void listFileInfo_missingBucket_throwsFileNotFoundException(boolean hnsApiEnabled, String path)
+      throws IOException {
+    GcsFileSystemOptions options = testOptionsBuilder().setHnsApiEnabled(hnsApiEnabled).build();
+    lenient()
+        .when(mockClient.getGcsItemInfo(any()))
+        .thenThrow(new FileNotFoundException("Not found"));
+    lenient()
+        .when(mockClient.getBucketProperties("missing-bucket"))
+        .thenThrow(GcsExceptionUtil.createBucketNotFoundException("missing-bucket"));
+    lenient()
+        .when(mockClient.listObjectsPage(any(), any()))
+        .thenThrow(GcsExceptionUtil.createBucketNotFoundException("missing-bucket"));
+
+    try (GcsFileSystemImpl customFs = new GcsFileSystemImpl(mockClient, options)) {
+      FileNotFoundException e =
+          assertThrows(FileNotFoundException.class, () -> customFs.listFileInfo(URI.create(path)));
+
+      assertThat(e).hasMessageThat().contains("missing-bucket");
+    }
+  }
+
+  @Test
+  void listFileInfo_hnsBucket_listsFoldersAsPrefixes() throws IOException {
+    GcsItemId folderId = listItemId("folder/");
+    GcsItemInfo file = listObjectInfo("folder/file.txt");
+    GcsItemId childFolderId = listItemId("folder/child/");
+    when(mockClient.getBucketProperties(TEST_BUCKET))
+        .thenReturn(BucketProperties.create(true, false));
+    when(mockClient.listObjectsPage(folderId, GcsListOptions.LIST_DIRECTORY_HNS))
+        .thenReturn(listPage(List.of(file), List.of(childFolderId)));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(folderId);
+
+    assertThat(listedItemInfos(listed))
+        .containsExactly(file, GcsItemInfo.createInferredDirectory(childFolderId));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"folder", "folder/"})
+  void listFileInfo_hnsEmptyFolder_returnsEmptyList(String objectName) throws IOException {
+    GcsItemId itemId = listItemId(objectName);
+    when(mockClient.getBucketProperties(TEST_BUCKET))
+        .thenReturn(BucketProperties.create(true, false));
+    lenient()
+        .when(mockClient.getGcsItemInfo(itemId))
+        .thenThrow(GcsExceptionUtil.createFileNotFoundException(itemId));
+    when(mockClient.listObjectsPage(itemId.toDirectoryId(), GcsListOptions.LIST_DIRECTORY_HNS))
+        .thenReturn(listPage(List.of(), List.of()));
+    when(mockClient.getFolderInfo(itemId))
+        .thenReturn(GcsItemInfo.createFolder(itemId.toDirectoryId(), 1L, 1L, 1L));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(itemId);
+
+    assertThat(listed).isEmpty();
+  }
+
+  @Test
+  void listFileInfo_hnsMissingFolder_throwsFileNotFoundException() throws IOException {
+    GcsItemId folderId = listItemId("missing/");
+    FileNotFoundException notFound = GcsExceptionUtil.createFileNotFoundException(folderId);
+    when(mockClient.getBucketProperties(TEST_BUCKET))
+        .thenReturn(BucketProperties.create(true, false));
+    when(mockClient.listObjectsPage(folderId, GcsListOptions.LIST_DIRECTORY_HNS))
+        .thenReturn(listPage(List.of(), List.of()));
+    when(mockClient.getFolderInfo(folderId)).thenThrow(notFound);
+
+    FileNotFoundException thrown =
+        assertThrows(FileNotFoundException.class, () -> gcsFileSystem.listFileInfo(folderId));
+
+    assertThat(thrown).isSameInstanceAs(notFound);
+  }
+
+  @Test
+  void listFileInfo_hnsApiDisabled_listsWithoutBucketLookup() throws IOException {
+    GcsFileSystemOptions options = testOptionsBuilder().setHnsApiEnabled(false).build();
+    GcsItemId dirId = listItemId("data/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(listObjectInfo("data/file.txt")), List.of()));
+
+    try (GcsFileSystemImpl customFs = new GcsFileSystemImpl(mockClient, options)) {
+      customFs.listFileInfo(dirId);
+    }
+
+    verify(mockClient, never()).getBucketProperties(any());
+  }
+
+  @Test
+  void listFileInfo_parallelExecution_objectLookupAccessDenied_interruptsBackgroundListing()
+      throws Exception {
+    GcsItemId itemId = listItemId("data");
+    CountDownLatch listingStarted = new CountDownLatch(1);
+    CountDownLatch listingInterrupted = new CountDownLatch(1);
+    when(mockClient.listObjectsPage(eq(itemId.toDirectoryId()), any()))
+        .thenAnswer(
+            invocation -> {
+              listingStarted.countDown();
+              try {
+                // Blocks until the listing is cancelled.
+                new CountDownLatch(1).await();
+              } catch (InterruptedException e) {
+                listingInterrupted.countDown();
+              }
+              throw new InterruptedIOException("listing interrupted");
+            });
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenAnswer(
+            invocation -> {
+              assertThat(listingStarted.await(5, TimeUnit.SECONDS)).isTrue();
+              throw new AccessDeniedException("gs://" + TEST_BUCKET + "/data");
+            });
+
+    assertThrows(AccessDeniedException.class, () -> gcsFileSystem.listFileInfo(itemId));
+
+    assertThat(listingInterrupted.await(5, TimeUnit.SECONDS)).isTrue();
+  }
+
+  @Test
+  void listFileInfo_parallelExecution_objectExistsAndListingFails_returnsObject()
+      throws IOException {
+    GcsItemId itemId = listItemId("data");
+    GcsItemInfo objectInfo = listObjectInfo("data");
+    CountDownLatch listingFailed = new CountDownLatch(1);
+    when(mockClient.listObjectsPage(eq(itemId.toDirectoryId()), any()))
+        .thenAnswer(
+            invocation -> {
+              listingFailed.countDown();
+              throw new AccessDeniedException("gs://" + TEST_BUCKET + "/data/");
+            });
+    when(mockClient.getGcsItemInfo(itemId))
+        .thenAnswer(
+            invocation -> {
+              assertThat(listingFailed.await(5, TimeUnit.SECONDS)).isTrue();
+              return objectInfo;
+            });
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(itemId);
+
+    assertThat(listedItemInfos(listed)).containsExactly(objectInfo);
+  }
+
+  @Test
+  void listFileInfo_hnsApiDisabledAndNothingListed_throwsFileNotFoundWithoutFolderLookup()
+      throws IOException {
+    GcsFileSystemOptions options = testOptionsBuilder().setHnsApiEnabled(false).build();
+    GcsItemId folderId = listItemId("empty-folder/");
+    when(mockClient.listObjectsPage(folderId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(), List.of()));
+
+    try (GcsFileSystemImpl customFs = new GcsFileSystemImpl(mockClient, options)) {
+      assertThrows(FileNotFoundException.class, () -> customFs.listFileInfo(folderId));
+    }
+
+    verify(mockClient, never()).getFolderInfo(any());
+  }
+
+  @Test
+  void listFileInfo_hnsFolderLookupAccessDenied_throwsAccessDeniedException() throws IOException {
+    GcsItemId folderId = listItemId("folder/");
+    AccessDeniedException denied = new AccessDeniedException("gs://" + TEST_BUCKET + "/folder/");
+    when(mockClient.getBucketProperties(TEST_BUCKET))
+        .thenReturn(BucketProperties.create(true, false));
+    when(mockClient.listObjectsPage(folderId, GcsListOptions.LIST_DIRECTORY_HNS))
+        .thenReturn(listPage(List.of(), List.of()));
+    when(mockClient.getFolderInfo(folderId)).thenThrow(denied);
+
+    AccessDeniedException thrown =
+        assertThrows(AccessDeniedException.class, () -> gcsFileSystem.listFileInfo(folderId));
+
+    assertThat(thrown).isSameInstanceAs(denied);
+  }
+
+  @Test
+  void listFileInfo_listedNameNotValidInUri_throwsIllegalArgumentException() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(listObjectInfo("data/my report.txt")), List.of()));
+
+    assertThrows(IllegalArgumentException.class, () -> gcsFileSystem.listFileInfo(dirId));
+  }
+
+  @Test
+  void listFileInfo_listingAccessDenied_throwsAccessDeniedException() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    AccessDeniedException denied = new AccessDeniedException("gs://" + TEST_BUCKET + "/data/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY)).thenThrow(denied);
+
+    AccessDeniedException thrown =
+        assertThrows(AccessDeniedException.class, () -> gcsFileSystem.listFileInfo(dirId));
+
+    assertThat(thrown).isSameInstanceAs(denied);
+  }
+
+  @Test
+  void listFileInfo_directoryResult_isUnmodifiable() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(listObjectInfo("data/file.txt")), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(dirId);
+
+    assertThrows(UnsupportedOperationException.class, listed::clear);
+  }
+
+  @Test
+  void listFileInfo_objectResult_isUnmodifiable() throws IOException {
+    GcsItemId itemId = listItemId("data");
+    when(mockClient.getGcsItemInfo(itemId)).thenReturn(listObjectInfo("data"));
+    lenient()
+        .when(mockClient.listObjectsPage(any(), any()))
+        .thenReturn(listPage(List.of(), List.of()));
+
+    List<GcsFileInfo> listed = gcsFileSystem.listFileInfo(itemId);
+
+    assertThrows(UnsupportedOperationException.class, listed::clear);
+  }
+
+  @Test
+  void listFileInfo_rootItemId_throwsUnsupportedOperationException() {
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class, () -> gcsFileSystem.listFileInfo(GcsItemId.ROOT));
+
+    assertThat(e).hasMessageThat().contains("root");
+    verifyNoInteractions(mockClient);
+  }
+
+  @Test
+  void listFileInfo_rootUri_throwsUnsupportedOperationException() {
+    assertThrows(
+        UnsupportedOperationException.class,
+        () -> gcsFileSystem.listFileInfo(GcsFileInfo.GCS_ROOT_URI));
+
+    verifyNoInteractions(mockClient);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"dir/subdir", "dir/subdir/"})
+  void listFileInfo_emptyBucketNameWithObjectName_throwsIllegalArgumentException(
+      String objectName) {
+    GcsItemId emptyBucketId =
+        GcsItemId.builder().setBucketName("").setObjectName(objectName).build();
+
+    assertThrows(IllegalArgumentException.class, () -> gcsFileSystem.listFileInfo(emptyBucketId));
+
+    verifyNoInteractions(mockClient);
+  }
+
+  @Test
+  void listFileInfo_uri_listsThePathItNames() throws IOException {
+    GcsItemId dirId = listItemId("data/");
+    GcsItemInfo file = listObjectInfo("data/file.txt");
+    when(mockClient.listObjectsPage(dirId, GcsListOptions.LIST_DIRECTORY))
+        .thenReturn(listPage(List.of(file), List.of()));
+
+    List<GcsFileInfo> listed =
+        gcsFileSystem.listFileInfo(URI.create("gs://" + TEST_BUCKET + "/data/"));
+
+    assertThat(listedItemInfos(listed)).containsExactly(file);
+  }
+
+  @Test
+  void listFileInfo_invalidUri_throwsIllegalArgumentException() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> gcsFileSystem.listFileInfo(URI.create("gs://" + TEST_BUCKET + "/dir//subdir")));
+
+    verifyNoInteractions(mockClient);
+  }
+
+  @Test
+  void listFileInfo_nullItemId_throwsNullPointerException() {
+    assertThrows(NullPointerException.class, () -> gcsFileSystem.listFileInfo((GcsItemId) null));
+  }
+
+  private static GcsItemId listItemId(String objectName) {
+    return GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(objectName).build();
+  }
+
+  private static GcsItemInfo listObjectInfo(String objectName) {
+    return GcsItemInfo.builder()
+        .setItemId(listItemId(objectName))
+        .setSize(100L)
+        .setContentGeneration(1L)
+        .build();
+  }
+
+  private static GcsListPage<GcsItemInfo> listPage(
+      List<GcsItemInfo> items, List<GcsItemId> prefixes) {
+    return GcsListPage.<GcsItemInfo>builder().setItems(items).setPrefixes(prefixes).build();
+  }
+
+  private static List<GcsItemInfo> listedItemInfos(List<GcsFileInfo> fileInfos) {
+    return fileInfos.stream().map(GcsFileInfo::getItemInfo).collect(Collectors.toList());
+  }
+
+  private static List<String> listedUris(List<GcsFileInfo> fileInfos) {
+    return fileInfos.stream()
+        .map(fileInfo -> fileInfo.getUri().toString())
+        .collect(Collectors.toList());
   }
 
   @Test
