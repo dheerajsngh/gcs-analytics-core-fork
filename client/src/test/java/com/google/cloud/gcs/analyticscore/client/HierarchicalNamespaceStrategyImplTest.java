@@ -21,21 +21,29 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import com.google.api.gax.rpc.UnimplementedException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.InOrder;
 
 class HierarchicalNamespaceStrategyImplTest {
 
@@ -296,7 +304,586 @@ class HierarchicalNamespaceStrategyImplTest {
     verify(mockClient, never()).getFolderInfo(any());
   }
 
+  @Test
+  void shouldRepairImplicitParentDirectory_returnsFalse() {
+    assertThat(strategy.shouldRepairImplicitParentDirectory()).isFalse();
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveEmptyFolder_deletesFolder() throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+
+    // Act
+    strategy.deleteDirectory(folderInfo, /* recursive= */ false);
+
+    // Assert
+    verify(mockClient).deleteFolder(folderId);
+    verify(mockClient, never()).deleteObject(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveHasChildObject_throwsDirectoryNotEmptyException()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo childObject =
+        GcsItemInfo.builder()
+            .setItemId(createFolderId(TEST_FOLDER + "/file.txt"))
+            .setSize(5L)
+            .build();
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().setItems(List.of(childObject)).build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/");
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveHasChildSubfolderPrefix_throwsDirectoryNotEmptyException()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixes(List.of(createFolderId(TEST_FOLDER + "/child/")))
+                .build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/");
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveZeroByteLegacyPrefixObject_deletesObjectBeforeFolder()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemId legacyId =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_FOLDER + "/")
+            .setContentGeneration(77L)
+            .build();
+    GcsItemInfo legacyPlaceholder =
+        GcsItemInfo.builder()
+            .setItemId(legacyId)
+            .setSize(0L)
+            .setContentGeneration(77L)
+            .setItemType(GcsItemInfo.ItemType.PLACEHOLDER_DIRECTORY)
+            .build();
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().setPrefixObject(legacyPlaceholder).build());
+
+    // Act
+    strategy.deleteDirectory(folderInfo, /* recursive= */ false);
+
+    // Assert
+    InOrder order = inOrder(mockClient);
+    order.verify(mockClient).deleteObject(legacyId);
+    order.verify(mockClient).deleteFolder(folderId);
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveZeroByteLegacyPrefixWithChildOnSecondPage_doesNotDeleteLegacy()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo legacyPlaceholder = GcsItemInfo.createPlaceholderDirectory(folderId);
+    GcsListOptions page1Options =
+        GcsListOptions.LIST_DIRECTORY_HNS.toBuilder()
+            .setPageSize(2)
+            .setFields(
+                GcsListOptions.ListField.NAME,
+                GcsListOptions.ListField.SIZE,
+                GcsListOptions.ListField.GENERATION)
+            .build();
+    GcsListOptions page2Options = page1Options.toBuilder().setPageToken("next").build();
+    when(mockClient.listObjectsPage(folderId, page1Options))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixObject(legacyPlaceholder)
+                .setNextPageToken("next")
+                .build());
+    when(mockClient.listObjectsPage(folderId, page2Options))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixes(List.of(createFolderId(TEST_FOLDER + "/sub/")))
+                .build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/");
+    verify(mockClient, never()).deleteObject(any());
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveNonEmptyPrefixObject_throwsDirectoryNotEmptyException()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo nonEmptyPrefixObject =
+        GcsItemInfo.builder()
+            .setItemId(folderId)
+            .setSize(42L)
+            .setItemType(GcsItemInfo.ItemType.PLACEHOLDER_DIRECTORY)
+            .build();
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder().setPrefixObject(nonEmptyPrefixObject).build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/");
+    verify(mockClient, never()).deleteObject(any());
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveUnresolvedSizePrefixObject_throwsDirectoryNotEmptyException()
+      throws IOException {
+    // Arrange: size == -1L is the unresolved sentinel and must fail closed as non-empty.
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo unresolvedSizePrefixObject =
+        GcsItemInfo.builder()
+            .setItemId(folderId)
+            .setSize(-1L)
+            .setItemType(GcsItemInfo.ItemType.PLACEHOLDER_DIRECTORY)
+            .build();
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder().setPrefixObject(unresolvedSizePrefixObject).build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/");
+    verify(mockClient, never()).deleteObject(any());
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveInterruptedAfterListing_skipsDeleteObjectAndDeleteFolder()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo legacyPlaceholder = GcsItemInfo.createPlaceholderDirectory(folderId);
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenAnswer(
+            inv -> {
+              Thread.currentThread().interrupt();
+              return GcsListPage.<GcsItemInfo>builder().setPrefixObject(legacyPlaceholder).build();
+            });
+
+    // Act
+    boolean stillInterrupted;
+    try {
+      assertThrows(
+          InterruptedIOException.class,
+          () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+    } finally {
+      stillInterrupted = Thread.interrupted();
+    }
+
+    // Assert
+    assertThat(stillInterrupted).isTrue();
+    verify(mockClient, never()).deleteObject(any());
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_nonRecursiveInterruptedAfterLegacyObjectDelete_skipsDeleteFolder()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+    GcsItemInfo legacyPlaceholder = GcsItemInfo.createPlaceholderDirectory(folderId);
+    when(mockClient.listObjectsPage(eq(folderId), any(GcsListOptions.class)))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().setPrefixObject(legacyPlaceholder).build());
+    doAnswer(
+            inv -> {
+              Thread.currentThread().interrupt();
+              return null;
+            })
+        .when(mockClient)
+        .deleteObject(folderId);
+
+    // Act
+    boolean stillInterrupted;
+    try {
+      assertThrows(
+          InterruptedIOException.class,
+          () -> strategy.deleteDirectory(folderInfo, /* recursive= */ false));
+    } finally {
+      stillInterrupted = Thread.interrupted();
+    }
+
+    // Assert
+    assertThat(stillInterrupted).isTrue();
+    verify(mockClient).deleteObject(folderId);
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteDirectory_recursiveServerSideEnabled_usesDeleteFolderRecursive() throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    GcsItemInfo folderInfo = GcsItemInfo.createFolder(folderId, 0L, 0L, 1L);
+
+    // Act
+    strategy.deleteDirectory(folderInfo, /* recursive= */ true);
+
+    // Assert
+    verify(mockClient).deleteFolderRecursive(folderId);
+    verify(mockClient, never()).listObjectsPage(any(), any());
+    verify(mockClient, never()).listFolders(any());
+  }
+
+  @Test
+  void deleteDirectory_recursiveInitialRpcRejected_fallsBackToClientSide() throws IOException {
+    // Arrange
+    HierarchicalNamespaceStrategyImpl syncStrategy =
+        new HierarchicalNamespaceStrategyImpl(
+            mockClient,
+            GcsFileSystemOptions.builder()
+                .setGcsClientOptions(GcsClientOptions.builder().setBatchThreads(0).build())
+                .build());
+    GcsItemId rootFolder = createFolderId("root/");
+    GcsItemId subFolder = createFolderId("root/sub/");
+    GcsItemId deepFolder = createFolderId("root/sub/deep/");
+    GcsItemId legacyObject =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("root/")
+            .setContentGeneration(10L)
+            .build();
+    GcsItemId fileObject =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("root/sub/deep/file.txt")
+            .setContentGeneration(20L)
+            .build();
+    doThrow(
+            new DeleteFolderRecursiveRejectedException(
+                "Failed to delete folder recursively: gs://" + TEST_BUCKET + "/root/",
+                mock(UnimplementedException.class)))
+        .when(mockClient)
+        .deleteFolderRecursive(rootFolder);
+    when(mockClient.listObjectsPage(rootFolder, NamespaceStrategy.DELETE_LIST_OPTIONS))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixObject(
+                    GcsItemInfo.builder()
+                        .setItemId(legacyObject)
+                        .setSize(0L)
+                        .setContentGeneration(10L)
+                        .setItemType(GcsItemInfo.ItemType.PLACEHOLDER_DIRECTORY)
+                        .build())
+                .setItems(
+                    List.of(
+                        GcsItemInfo.builder()
+                            .setItemId(fileObject)
+                            .setSize(5L)
+                            .setContentGeneration(20L)
+                            .build()))
+                .build());
+    when(mockClient.listFolders(rootFolder))
+        .thenReturn(
+            List.of(
+                GcsItemInfo.createFolder(rootFolder, 0L, 0L, 1L),
+                GcsItemInfo.createFolder(subFolder, 0L, 0L, 1L),
+                GcsItemInfo.createFolder(deepFolder, 0L, 0L, 1L)));
+
+    List<String> operations = new ArrayList<>();
+    doAnswer(
+            inv -> {
+              operations.add(
+                  "deleteObject:" + inv.getArgument(0, GcsItemId.class).getObjectName().get());
+              return null;
+            })
+        .when(mockClient)
+        .deleteObject(any());
+    doAnswer(
+            inv -> {
+              operations.add(
+                  "deleteFolder:" + inv.getArgument(0, GcsItemId.class).getObjectName().get());
+              return null;
+            })
+        .when(mockClient)
+        .deleteFolder(any());
+
+    // Act
+    syncStrategy.deleteDirectory(
+        GcsItemInfo.createFolder(rootFolder, 0L, 0L, 1L), /* recursive= */ true);
+
+    // Assert
+    assertThat(operations)
+        .containsExactly(
+            "deleteObject:root/",
+            "deleteObject:root/sub/deep/file.txt",
+            "deleteFolder:root/sub/deep/",
+            "deleteFolder:root/sub/",
+            "deleteFolder:root/")
+        .inOrder();
+  }
+
+  @Test
+  void deleteDirectory_recursiveServerSideAccessDenied_doesNotFallBack() throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    doThrow(new AccessDeniedException("gs://" + TEST_BUCKET + "/" + TEST_FOLDER + "/"))
+        .when(mockClient)
+        .deleteFolderRecursive(folderId);
+
+    // Act & Assert
+    assertThrows(
+        AccessDeniedException.class,
+        () ->
+            strategy.deleteDirectory(
+                GcsItemInfo.createFolder(folderId, 0L, 0L, 1L), /* recursive= */ true));
+    verify(mockClient, never()).listObjectsPage(any(), any());
+    verify(mockClient, never()).listFolders(any());
+  }
+
+  @Test
+  void deleteDirectory_recursiveServerSidePlainIOException_doesNotFallBack() throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    doThrow(new IOException("Timed out waiting to delete folder recursively"))
+        .when(mockClient)
+        .deleteFolderRecursive(folderId);
+
+    // Act & Assert
+    assertThrows(
+        IOException.class,
+        () ->
+            strategy.deleteDirectory(
+                GcsItemInfo.createFolder(folderId, 0L, 0L, 1L), /* recursive= */ true));
+    verify(mockClient, never()).listObjectsPage(any(), any());
+    verify(mockClient, never()).listFolders(any());
+  }
+
+  @Test
+  void deleteDirectory_recursiveServerSideInterruptedIOException_doesNotFallBack()
+      throws IOException {
+    // Arrange
+    GcsItemId folderId = createFolderId(TEST_FOLDER + "/");
+    doThrow(new InterruptedIOException("interrupted"))
+        .when(mockClient)
+        .deleteFolderRecursive(folderId);
+
+    // Act & Assert
+    assertThrows(
+        InterruptedIOException.class,
+        () ->
+            strategy.deleteDirectory(
+                GcsItemInfo.createFolder(folderId, 0L, 0L, 1L), /* recursive= */ true));
+    verify(mockClient, never()).listObjectsPage(any(), any());
+    verify(mockClient, never()).listFolders(any());
+  }
+
+  @Test
+  void deleteDirectory_recursiveServerSideDisabled_runsClientSideDirectly() throws IOException {
+    // Arrange
+    HierarchicalNamespaceStrategyImpl clientSideStrategy =
+        new HierarchicalNamespaceStrategyImpl(
+            mockClient,
+            GcsFileSystemOptions.builder()
+                .setHnsServerSideRecursiveDeleteEnabled(false)
+                .setGcsClientOptions(GcsClientOptions.builder().setBatchThreads(0).build())
+                .build());
+    GcsItemId rootFolder = createFolderId("root/");
+    GcsItemId childFolder = createFolderId("root/child/");
+    when(mockClient.listObjectsPage(rootFolder, NamespaceStrategy.DELETE_LIST_OPTIONS))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+    // Intentionally omit rootFolder from listFolders response to verify includeRootFolder adds it.
+    when(mockClient.listFolders(rootFolder))
+        .thenReturn(List.of(GcsItemInfo.createFolder(childFolder, 0L, 0L, 1L)));
+
+    // Act
+    clientSideStrategy.deleteDirectory(
+        GcsItemInfo.createFolder(rootFolder, 0L, 0L, 1L), /* recursive= */ true);
+
+    // Assert
+    verify(mockClient, never()).deleteFolderRecursive(any());
+    InOrder order = inOrder(mockClient);
+    order.verify(mockClient).deleteFolder(childFolder);
+    order.verify(mockClient).deleteFolder(rootFolder);
+  }
+
+  @Test
+  void deleteDirectory_recursiveClientSidePhase1Failure_skipsPhase2FolderDeletion()
+      throws IOException {
+    // Arrange
+    HierarchicalNamespaceStrategyImpl clientSideStrategy =
+        new HierarchicalNamespaceStrategyImpl(
+            mockClient,
+            GcsFileSystemOptions.builder()
+                .setHnsServerSideRecursiveDeleteEnabled(false)
+                .setGcsClientOptions(GcsClientOptions.builder().setBatchThreads(0).build())
+                .build());
+    GcsItemId rootFolder = createFolderId("root/");
+    GcsItemId childFile =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("root/child.txt")
+            .setContentGeneration(11L)
+            .build();
+    when(mockClient.listObjectsPage(rootFolder, NamespaceStrategy.DELETE_LIST_OPTIONS))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setItems(
+                    List.of(
+                        GcsItemInfo.builder()
+                            .setItemId(childFile)
+                            .setSize(5L)
+                            .setContentGeneration(11L)
+                            .build()))
+                .build());
+    doThrow(new IOException("object delete failed")).when(mockClient).deleteObject(childFile);
+
+    // Act
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () ->
+                clientSideStrategy.deleteDirectory(
+                    GcsItemInfo.createFolder(rootFolder, 0L, 0L, 1L), /* recursive= */ true));
+
+    // Assert
+    assertThat(e).hasMessageThat().isEqualTo("object delete failed");
+    verify(mockClient, never()).listFolders(any());
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteBucketContents_nonRecursiveEmpty_succeeds() throws IOException {
+    // Arrange
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.EMPTINESS_CHECK_HNS))
+        .thenReturn(GcsListPage.<GcsItemInfo>builder().build());
+
+    // Act
+    strategy.deleteBucketContents(bucketId, /* recursive= */ false);
+
+    // Assert
+    verify(mockClient).listObjectsPage(bucketId, GcsListOptions.EMPTINESS_CHECK_HNS);
+    verify(mockClient, never()).deleteFolder(any());
+  }
+
+  @Test
+  void deleteBucketContents_nonRecursiveHasEmptyFolderPrefix_throwsDirectoryNotEmptyException()
+      throws IOException {
+    // Arrange
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    when(mockClient.listObjectsPage(bucketId, GcsListOptions.EMPTINESS_CHECK_HNS))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setPrefixes(List.of(createFolderId("empty-folder/")))
+                .build());
+
+    // Act
+    DirectoryNotEmptyException e =
+        assertThrows(
+            DirectoryNotEmptyException.class,
+            () -> strategy.deleteBucketContents(bucketId, /* recursive= */ false));
+
+    // Assert
+    assertThat(e.getFile()).isEqualTo("gs://" + TEST_BUCKET);
+  }
+
+  @Test
+  void deleteBucketContents_recursive_clearsClientSideNeverCallsDeleteFolderRecursive()
+      throws IOException {
+    // Arrange
+    HierarchicalNamespaceStrategyImpl syncStrategy =
+        new HierarchicalNamespaceStrategyImpl(
+            mockClient,
+            GcsFileSystemOptions.builder()
+                .setHnsServerSideRecursiveDeleteEnabled(true)
+                .setGcsClientOptions(GcsClientOptions.builder().setBatchThreads(0).build())
+                .build());
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId fileId =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("a/b/file.txt")
+            .setContentGeneration(9L)
+            .build();
+    GcsItemId folderA = createFolderId("a/");
+    GcsItemId folderAB = createFolderId("a/b/");
+    when(mockClient.listObjectsPage(bucketId, NamespaceStrategy.DELETE_LIST_OPTIONS))
+        .thenReturn(
+            GcsListPage.<GcsItemInfo>builder()
+                .setItems(
+                    List.of(
+                        GcsItemInfo.builder()
+                            .setItemId(fileId)
+                            .setSize(4L)
+                            .setContentGeneration(9L)
+                            .build()))
+                .build());
+    when(mockClient.listFolders(bucketId))
+        .thenReturn(
+            List.of(
+                GcsItemInfo.createFolder(folderA, 0L, 0L, 1L),
+                GcsItemInfo.createFolder(folderAB, 0L, 0L, 1L)));
+
+    // Act
+    syncStrategy.deleteBucketContents(bucketId, /* recursive= */ true);
+
+    // Assert
+    verify(mockClient, never()).deleteFolderRecursive(any());
+    InOrder order = inOrder(mockClient);
+    order.verify(mockClient).deleteObject(fileId);
+    order.verify(mockClient).deleteFolder(folderAB);
+    order.verify(mockClient).deleteFolder(folderA);
+  }
+
   private static GcsItemId createGcsItemId(String objectName) {
     return GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(objectName).build();
+  }
+
+  private static GcsItemId createFolderId(String name) {
+    return createGcsItemId(name);
   }
 }

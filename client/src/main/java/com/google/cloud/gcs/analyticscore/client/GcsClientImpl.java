@@ -29,6 +29,7 @@ import com.google.api.gax.rpc.FixedHeaderProvider;
 import com.google.api.gax.rpc.NotFoundException;
 import com.google.api.gax.rpc.PermissionDeniedException;
 import com.google.api.gax.rpc.UnauthenticatedException;
+import com.google.api.gax.rpc.UnimplementedException;
 import com.google.auth.Credentials;
 import com.google.cloud.gcs.analyticscore.client.GcsClientOptions.Protocol;
 import com.google.cloud.gcs.analyticscore.client.GcsReadChannel.ItemInfoProvider;
@@ -1204,6 +1205,10 @@ class GcsClientImpl implements GcsClient {
       LOG.debug("Folder to delete recursively was not found: {}", folderId);
       return;
     } catch (Exception e) {
+      if (isFallbackEligibleRejection(e)) {
+        throw new DeleteFolderRecursiveRejectedException(
+            "Failed to delete folder recursively: " + UriUtil.getStringPath(folderId), e);
+      }
       throw GcsExceptionUtil.translateDeleteFolderRecursiveException(e, folderId);
     }
     try {
@@ -1233,8 +1238,34 @@ class GcsClientImpl implements GcsClient {
         LOG.debug("Folder to delete recursively was not found: {}", folderId);
         return;
       }
+      if (isInitialRpcRejected(future) && isFallbackEligibleRejection(cause)) {
+        throw new DeleteFolderRecursiveRejectedException(
+            "Failed to delete folder recursively: " + UriUtil.getStringPath(folderId), cause);
+      }
       throw GcsExceptionUtil.translateDeleteFolderRecursiveException(cause, folderId);
     }
+  }
+
+  /**
+   * Returns {@code true} only if {@code future} exposes its initial future and that initial RPC
+   * failed before the server accepted a long-running operation. Fails closed ({@code false}) when
+   * the initial future is unavailable, still in flight, cancelled, or completed normally.
+   */
+  private static boolean isInitialRpcRejected(OperationFuture<?, ?> future) {
+    ApiFuture<OperationSnapshot> initialFuture;
+    try {
+      initialFuture = future.getInitialFuture();
+    } catch (UnsupportedOperationException e) {
+      return false;
+    }
+    if (!isDone(initialFuture) || initialFuture.isCancelled()) {
+      return false;
+    }
+    return !completedNormally(initialFuture);
+  }
+
+  private static boolean isFallbackEligibleRejection(@Nullable Throwable cause) {
+    return cause instanceof UnimplementedException;
   }
 
   /**

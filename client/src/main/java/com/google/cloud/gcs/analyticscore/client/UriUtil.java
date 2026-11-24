@@ -21,6 +21,7 @@ import static com.google.common.base.Strings.isNullOrEmpty;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Optional;
 
 /**
  * Utility class for parsing and formatting GCS URIs.
@@ -220,5 +221,99 @@ final class UriUtil {
 
   static String toDirectoryPath(String path) {
     return isNullOrEmpty(path) || path.endsWith(PATH_DELIMITER) ? path : path + PATH_DELIMITER;
+  }
+
+  /**
+   * Returns the immediate parent identifier of {@code itemId} with any content generation stripped:
+   *
+   * <ul>
+   *   <li>{@link GcsItemId#ROOT} -> {@link Optional#empty()}
+   *   <li>Bucket ({@code gs://bucket}) -> {@link GcsItemId#ROOT}
+   *   <li>Top-level object or directory ({@code gs://bucket/obj}, {@code gs://bucket/dir/}) ->
+   *       bucket ID ({@code gs://bucket})
+   *   <li>Nested object or directory ({@code gs://bucket/a/b}, {@code gs://bucket/a/b/}) -> parent
+   *       directory ID with trailing slash ({@code gs://bucket/a/})
+   * </ul>
+   *
+   * @throws NullPointerException if {@code itemId} is {@code null}
+   * @throws IllegalArgumentException if {@code itemId} has an empty bucket name with a non-empty
+   *     object name
+   */
+  static Optional<GcsItemId> getParentId(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.isRoot()) {
+      return Optional.empty();
+    }
+    if (itemId.isBucket()) {
+      return Optional.of(GcsItemId.ROOT);
+    }
+    checkArgument(itemId.isGcsObject(), "Invalid itemId: %s", itemId);
+    String trimmed = removeTrailingSlash(itemId.getObjectName().get());
+    int lastSlash = trimmed.lastIndexOf('/');
+    if (lastSlash <= 0) {
+      return Optional.of(GcsItemId.builder().setBucketName(itemId.getBucketName()).build());
+    }
+    return Optional.of(
+        GcsItemId.builder()
+            .setBucketName(itemId.getBucketName())
+            .setObjectName(trimmed.substring(0, lastSlash + 1))
+            .build());
+  }
+
+  /** Returns {@code itemId} without any {@link GcsItemId#getContentGeneration()}. */
+  static GcsItemId withoutContentGeneration(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.getContentGeneration().isEmpty()) {
+      return itemId;
+    }
+    GcsItemId.Builder builder = GcsItemId.builder().setBucketName(itemId.getBucketName());
+    itemId.getObjectName().ifPresent(builder::setObjectName);
+    return builder.build();
+  }
+
+  /**
+   * Returns {@code true} if any {@code '/'}–delimited path segment in {@code objectName} is {@code
+   * "."} or {@code ".."}.
+   */
+  static boolean hasDotSegment(String objectName) {
+    if (isNullOrEmpty(objectName)) {
+      return false;
+    }
+    int start = 0;
+    int len = objectName.length();
+    while (start < len) {
+      int end = objectName.indexOf('/', start);
+      if (end < 0) {
+        end = len;
+      }
+      int segmentLength = end - start;
+      if (segmentLength == 1 && objectName.charAt(start) == '.') {
+        return true;
+      }
+      if (segmentLength == 2
+          && objectName.charAt(start) == '.'
+          && objectName.charAt(start + 1) == '.') {
+        return true;
+      }
+      start = end + 1;
+    }
+    return false;
+  }
+
+  /**
+   * Returns the nesting depth of a directory path, counted as the number of {@code '/'} delimiters
+   * remaining after removing a single trailing {@code '/'}. For example, {@code "a/"} has depth
+   * {@code 0} and {@code "a/b/c/"} has depth {@code 2}.
+   */
+  static int directoryDepth(GcsItemId dirId) {
+    checkNotNull(dirId, "dirId should not be null");
+    String path = removeTrailingSlash(dirId.getObjectName().orElse(""));
+    int depth = 0;
+    for (int i = 0; i < path.length(); i++) {
+      if (path.charAt(i) == '/') {
+        depth++;
+      }
+    }
+    return depth;
   }
 }

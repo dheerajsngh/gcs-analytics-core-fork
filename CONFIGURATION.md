@@ -125,11 +125,14 @@ These settings control how many times the underlying Cloud Storage client retrie
 
 ### Directory Operations
 
-These settings control how `mkdirs` creates directories.
+These settings control how `mkdirs` and `delete` manage directories and buckets.
 
 | Property | Description | Default Value |
 | :--- | :--- | :--- |
 | `analytics-core.create.items.conflict.check.enable` | Before `mkdirs` creates a directory, checks that no file exists at the target path or any of its parent paths, with one `storage.objects.get` request per path level. The check is best-effort: it isn't atomic with concurrent writes, and it skips paths that the caller can't read. | `true` |
+| `analytics-core.directory.implicit-repair.enable` | When deleting an object or directory on a flat-namespace bucket, performs a best-effort repair to create a 0-byte directory marker for its immediate parent directory if the parent was implicit. Ignored on hierarchical namespace (HNS) buckets, where native folders persist without marker objects. | `true` |
+| `analytics-core.bucket.delete.enable` | Controls whether `delete` removes the bucket resource itself after validating emptiness (non-recursive) or clearing bucket contents (recursive). When `false`, bucket contents are still checked or cleared and `deleteBucket` is skipped with an info log. | `false` |
+| `analytics-core.hierarchical.namespace.server-side-recursive-delete.enable` | Controls whether recursive directory deletes on hierarchical namespace (HNS) buckets use the server-side Storage Control `DeleteFolderRecursive` long-running operation (falling back to client-side deletion only if the server rejects the initial request as unimplemented before accepting an operation). If waiting for an accepted operation times out, fails polling, or is interrupted, the call throws while the server may continue deleting asynchronously, and concurrent `NOT_FOUND` on an in-flight delete returns normally. Set to `false` for strictly synchronous client-side recursive deletion. | `true` |
 
 ### Telemetry and Monitoring
 

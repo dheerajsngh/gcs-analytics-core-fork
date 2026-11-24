@@ -28,6 +28,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /** Tests the default methods of {@link GcsFileSystem}. */
 class GcsFileSystemTest {
@@ -102,5 +104,62 @@ class GcsFileSystemTest {
     GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
 
     assertThrows(NullPointerException.class, () -> fileSystem.listFileInfo((URI) null));
+  }
+
+  @Test
+  void delete_itemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class, () -> fileSystem.delete(DIR_ITEM_ID, true));
+    assertThat(e).hasMessageThat().startsWith("delete is not supported by ");
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void delete_uri_delegatesToItemIdOverload(boolean recursive) throws IOException {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+    doNothing().when(fileSystem).delete(DIR_ITEM_ID, recursive);
+
+    fileSystem.delete(DIR_URI, recursive);
+
+    verify(fileSystem).delete(DIR_ITEM_ID, recursive);
+  }
+
+  @Test
+  void delete_percentEncodedUri_decodesPathBeforeDelegating() throws IOException {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+    URI encodedUri = URI.create("gs://test-bucket/my%20dir/a%25b%3Fc%23d.txt");
+    GcsItemId decodedId =
+        GcsItemId.builder()
+            .setBucketName("test-bucket")
+            .setObjectName("my dir/a%b?c#d.txt")
+            .build();
+    doNothing().when(fileSystem).delete(decodedId, false);
+
+    fileSystem.delete(encodedUri, false);
+
+    verify(fileSystem).delete(decodedId, false);
+  }
+
+  @Test
+  void delete_uriWithItemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    assertThrows(UnsupportedOperationException.class, () -> fileSystem.delete(DIR_URI, false));
+  }
+
+  @Test
+  void delete_nullUri_throwsNullPointerException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    assertThrows(NullPointerException.class, () -> fileSystem.delete((URI) null, false));
+  }
+
+  @Test
+  void publicSignatures_containNoGuavaTypes() {
+    ApiSignatureTestUtils.assertNoGuavaTypesInSignatures(
+        GcsFileSystem.class, GcsFileSystemOptions.class, GcsFileSystemOptions.Builder.class);
   }
 }

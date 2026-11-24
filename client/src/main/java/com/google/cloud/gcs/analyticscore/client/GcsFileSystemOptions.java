@@ -33,6 +33,11 @@ public abstract class GcsFileSystemOptions {
       "analytics-core.metadata.lookup.parallel.enable";
   private static final String CREATE_ITEMS_CONFLICT_CHECK_ENABLE_KEY =
       "analytics-core.create.items.conflict.check.enable";
+  private static final String AUTO_REPAIR_IMPLICIT_DIRECTORIES_ENABLE_KEY =
+      "analytics-core.directory.implicit-repair.enable";
+  private static final String BUCKET_DELETE_ENABLE_KEY = "analytics-core.bucket.delete.enable";
+  private static final String HNS_SERVER_SIDE_RECURSIVE_DELETE_ENABLE_KEY =
+      "analytics-core.hierarchical.namespace.server-side-recursive-delete.enable";
 
   /**
    * Cloud Storage client to use.
@@ -77,6 +82,36 @@ public abstract class GcsFileSystemOptions {
    */
   public abstract boolean isCreateItemsConflictCheckEnabled();
 
+  /**
+   * Returns whether deleting an object or directory on a flat-namespace bucket performs a
+   * best-effort repair to create a 0-byte placeholder marker for its immediate parent directory if
+   * the parent was implicit.
+   *
+   * <p>Defaults to {@code true}. Ignored on hierarchical namespace (HNS) buckets, where native
+   * folders persist without placeholder objects.
+   */
+  public abstract boolean isAutoRepairImplicitDirectoriesEnabled();
+
+  /**
+   * Returns whether {@link GcsFileSystem#delete} deletes the bucket resource itself after checking
+   * or clearing bucket contents.
+   *
+   * <p>Defaults to {@code false}: when disabled, {@code delete} on a bucket still validates
+   * emptiness (non-recursive) or clears its objects and folders (recursive) and then skips {@link
+   * GcsClient#deleteBucket(GcsItemId)}.
+   */
+  public abstract boolean isBucketDeleteEnabled();
+
+  /**
+   * Returns whether recursive directory deletes on hierarchical namespace (HNS) buckets use the
+   * server-side Storage Control {@code DeleteFolderRecursive} long-running operation.
+   *
+   * <p>Defaults to {@code true}. When {@code false}, recursive HNS directory deletes run
+   * synchronously on the client by deleting all objects first and then deleting native folders from
+   * deepest to shallowest.
+   */
+  public abstract boolean isHnsServerSideRecursiveDeleteEnabled();
+
   public abstract Builder toBuilder();
 
   @SuppressWarnings("deprecation")
@@ -87,6 +122,9 @@ public abstract class GcsFileSystemOptions {
         .setHnsApiEnabled(true)
         .setMetadataLookupParallelEnabled(true)
         .setCreateItemsConflictCheckEnabled(true)
+        .setAutoRepairImplicitDirectoriesEnabled(true)
+        .setBucketDeleteEnabled(false)
+        .setHnsServerSideRecursiveDeleteEnabled(true)
         .setGcsAuthOptions(GcsAuthOptions.builder().build())
         .setGcsClientOptions(GcsClientOptions.builder().build())
         .setGcsCacheOptions(GcsCacheOptions.builder().build())
@@ -128,6 +166,25 @@ public abstract class GcsFileSystemOptions {
       optionsBuilder.setCreateItemsConflictCheckEnabled(
           Boolean.parseBoolean(createItemsConflictCheckEnabled.get()));
     }
+    Optional<String> autoRepairImplicitDirectoriesEnabled =
+        ConfigurationUtil.getTrimmedValue(
+            analyticsCoreOptions, prefix + AUTO_REPAIR_IMPLICIT_DIRECTORIES_ENABLE_KEY);
+    if (autoRepairImplicitDirectoriesEnabled.isPresent()) {
+      optionsBuilder.setAutoRepairImplicitDirectoriesEnabled(
+          Boolean.parseBoolean(autoRepairImplicitDirectoriesEnabled.get()));
+    }
+    Optional<String> bucketDeleteEnabled =
+        ConfigurationUtil.getTrimmedValue(analyticsCoreOptions, prefix + BUCKET_DELETE_ENABLE_KEY);
+    if (bucketDeleteEnabled.isPresent()) {
+      optionsBuilder.setBucketDeleteEnabled(Boolean.parseBoolean(bucketDeleteEnabled.get()));
+    }
+    Optional<String> hnsServerSideRecursiveDeleteEnabled =
+        ConfigurationUtil.getTrimmedValue(
+            analyticsCoreOptions, prefix + HNS_SERVER_SIDE_RECURSIVE_DELETE_ENABLE_KEY);
+    if (hnsServerSideRecursiveDeleteEnabled.isPresent()) {
+      optionsBuilder.setHnsServerSideRecursiveDeleteEnabled(
+          Boolean.parseBoolean(hnsServerSideRecursiveDeleteEnabled.get()));
+    }
 
     optionsBuilder.setGcsAuthOptions(
         GcsAuthOptions.createFromOptions(analyticsCoreOptions, prefix));
@@ -159,6 +216,14 @@ public abstract class GcsFileSystemOptions {
 
     public abstract Builder setCreateItemsConflictCheckEnabled(
         boolean isCreateItemsConflictCheckEnabled);
+
+    public abstract Builder setAutoRepairImplicitDirectoriesEnabled(
+        boolean isAutoRepairImplicitDirectoriesEnabled);
+
+    public abstract Builder setBucketDeleteEnabled(boolean isBucketDeleteEnabled);
+
+    public abstract Builder setHnsServerSideRecursiveDeleteEnabled(
+        boolean isHnsServerSideRecursiveDeleteEnabled);
 
     public abstract Builder setMetadataLookupParallelEnabled(
         boolean isMetadataLookupParallelEnabled);

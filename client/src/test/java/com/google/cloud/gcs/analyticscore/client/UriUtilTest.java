@@ -487,4 +487,147 @@ class UriUtilTest {
   void validateDirectoryItemId_nullItemId_throwsNullPointerException() {
     assertThrows(NullPointerException.class, () -> UriUtil.validateDirectoryItemId(null));
   }
+
+  @Test
+  void getParentId_root_returnsEmpty() {
+    assertThat(UriUtil.getParentId(GcsItemId.ROOT)).isEmpty();
+  }
+
+  @Test
+  void getParentId_bucket_returnsRoot() {
+    GcsItemId bucketId = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+
+    assertThat(UriUtil.getParentId(bucketId)).hasValue(GcsItemId.ROOT);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"file.txt", "dir/", "/", "/file.txt"})
+  void getParentId_topLevelObjectOrDirectory_returnsBucketId(String objectName) {
+    GcsItemId itemId =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(objectName)
+            .setContentGeneration(42L)
+            .build();
+    GcsItemId expectedBucket = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+
+    assertThat(UriUtil.getParentId(itemId)).hasValue(expectedBucket);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"a/b", "a/b/"})
+  void getParentId_nestedObjectOrDirectory_returnsParentDirectoryWithoutGeneration(
+      String objectName) {
+    GcsItemId itemId =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(objectName)
+            .setContentGeneration(99L)
+            .build();
+    GcsItemId expectedParent =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/").build();
+
+    assertThat(UriUtil.getParentId(itemId)).hasValue(expectedParent);
+  }
+
+  @Test
+  void getParentId_deeplyNestedObject_returnsImmediateParentDirectory() {
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/c/file.parquet").build();
+    GcsItemId expectedParent =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/c/").build();
+
+    assertThat(UriUtil.getParentId(itemId)).hasValue(expectedParent);
+  }
+
+  @Test
+  void getParentId_emptyBucketWithObject_throwsIllegalArgumentException() {
+    GcsItemId malformed = GcsItemId.builder().setBucketName("").setObjectName("a/b").build();
+
+    assertThrows(IllegalArgumentException.class, () -> UriUtil.getParentId(malformed));
+  }
+
+  @Test
+  void getParentId_nullItemId_throwsNullPointerException() {
+    assertThrows(NullPointerException.class, () -> UriUtil.getParentId(null));
+  }
+
+  @Test
+  void withoutContentGeneration_withGeneration_stripsGeneration() {
+    GcsItemId withGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_OBJECT)
+            .setContentGeneration(123L)
+            .build();
+
+    GcsItemId stripped = UriUtil.withoutContentGeneration(withGen);
+
+    assertThat(stripped)
+        .isEqualTo(
+            GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_OBJECT).build());
+  }
+
+  @Test
+  void withoutContentGeneration_withoutGeneration_returnsSameInstance() {
+    GcsItemId withoutGen =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_OBJECT).build();
+
+    assertThat(UriUtil.withoutContentGeneration(withoutGen)).isSameInstanceAs(withoutGen);
+  }
+
+  @Test
+  void withoutContentGeneration_nullItemId_throwsNullPointerException() {
+    assertThrows(NullPointerException.class, () -> UriUtil.withoutContentGeneration(null));
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        ".",
+        "..",
+        "./",
+        "../",
+        "./a",
+        "../a",
+        "a/.",
+        "a/..",
+        "a/./",
+        "a/../",
+        "staging/../victim.txt",
+        "a/./b"
+      })
+  void hasDotSegment_pathsWithDotSegment_returnsTrue(String path) {
+    assertThat(UriUtil.hasDotSegment(path)).isTrue();
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {"", "/", "a/b/c/", ".hidden", "a/.hidden", "a/..b", "a/b...", "a//b", "file.txt"})
+  void hasDotSegment_pathsWithoutDotSegment_returnsFalse(String path) {
+    assertThat(UriUtil.hasDotSegment(path)).isFalse();
+  }
+
+  @Test
+  void hasDotSegment_nullPath_returnsFalse() {
+    assertThat(UriUtil.hasDotSegment(null)).isFalse();
+  }
+
+  @Test
+  void directoryDepth_variousNestingLevels_countsInternalSlashes() {
+    assertThat(
+            UriUtil.directoryDepth(
+                GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/").build()))
+        .isEqualTo(0);
+    assertThat(
+            UriUtil.directoryDepth(
+                GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/").build()))
+        .isEqualTo(1);
+    assertThat(
+            UriUtil.directoryDepth(
+                GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/c/").build()))
+        .isEqualTo(2);
+    assertThat(UriUtil.directoryDepth(GcsItemId.builder().setBucketName(TEST_BUCKET).build()))
+        .isEqualTo(0);
+  }
 }

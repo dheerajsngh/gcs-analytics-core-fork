@@ -22,6 +22,7 @@ import java.io.InterruptedIOException;
 import java.net.URI;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.util.List;
 
@@ -297,5 +298,113 @@ public interface GcsFileSystem extends AutoCloseable {
    */
   default void mkdirs(GcsItemId itemId) throws IOException {
     throw new UnsupportedOperationException("mkdirs is not supported by " + getClass().getName());
+  }
+
+  /**
+   * Deletes the object, directory, or bucket at the specified {@code gs://} URI.
+   *
+   * <p>Semantics follow {@link #delete(GcsItemId, boolean)}. {@code path} is parsed as in {@link
+   * #getFileInfo(URI)}: its path is percent-decoded, so {@code gs://bucket/a%20b.txt} deletes the
+   * object {@code a b.txt}. In an object name, write {@code %} as {@code %25}, {@code ?} as {@code
+   * %3F}, and {@code #} as {@code %23}; {@link GcsItemId#toUri()} builds such a URI from a name.
+   *
+   * <p>The default implementation parses {@code path} and calls {@link #delete(GcsItemId,
+   * boolean)}.
+   *
+   * @param path the {@code gs://} URI of the object, directory, or bucket to delete
+   * @param recursive if {@code true} and {@code path} is a directory or bucket, recursively deletes
+   *     all contained objects and subdirectories; if {@code false}, fails with {@link
+   *     DirectoryNotEmptyException} when non-empty
+   * @throws NullPointerException if {@code path} is {@code null}
+   * @throws IllegalArgumentException if {@code path} is the GCS root or not a valid {@code gs://}
+   *     URI (for example, {@code gs:///} or consecutive slashes), or if it has a query or a
+   *     fragment
+   * @throws FileNotFoundException if nothing exists at {@code path}
+   * @throws DirectoryNotEmptyException if {@code recursive} is {@code false} and the target
+   *     directory or bucket is not empty
+   * @throws AccessDeniedException if the caller lacks required GCS permissions
+   * @throws InterruptedIOException if the calling thread is interrupted before or while deleting,
+   *     or while waiting on a long-running operation
+   * @throws UnsupportedOperationException if this implementation does not support {@link
+   *     #delete(GcsItemId, boolean)}
+   * @throws IOException if an I/O error occurs
+   */
+  default void delete(URI path, boolean recursive) throws IOException {
+    delete(UriUtil.getItemIdFromUri(path), recursive);
+  }
+
+  /**
+   * Deletes the GCS object, directory, or bucket identified by {@code itemId}:
+   *
+   * <ul>
+   *   <li><b>Null or root ({@link GcsItemId#ROOT})</b>: rejected with {@link NullPointerException}
+   *       (for {@code null}) or {@link IllegalArgumentException} (for {@link GcsItemId#ROOT} or an
+   *       empty bucket name).
+   *   <li><b>Content generation</b>: any {@link GcsItemId#getContentGeneration()} on the input
+   *       {@code itemId} is ignored; generation-match preconditions use the positive content
+   *       generation observed from the live metadata lookup or listing.
+   *   <li><b>Missing path</b>: throws {@link FileNotFoundException} if nothing exists at {@code
+   *       itemId}.
+   *   <li><b>Single object</b>: deletes the object via {@link GcsClient#deleteObject(GcsItemId)},
+   *       sending a generation-match precondition when a positive content generation is known.
+   *   <li><b>Non-recursive directory or bucket ({@code recursive == false})</b>: throws {@link
+   *       DirectoryNotEmptyException} if any child object, nested folder, or (on HNS) non-empty
+   *       object at the directory path exists; otherwise removes the empty directory (clearing any
+   *       0-byte legacy placeholder first on HNS) or bucket.
+   *   <li><b>Recursive directory ({@code recursive == true})</b>: on flat-namespace buckets,
+   *       deletes all child objects first, then nested directory placeholders from deepest to
+   *       shallowest depth, and finally the target directory placeholder itself. On hierarchical
+   *       namespace (HNS) buckets, uses the server-side Storage Control {@code
+   *       DeleteFolderRecursive} long-running operation when {@link
+   *       GcsFileSystemOptions#isHnsServerSideRecursiveDeleteEnabled()} is {@code true} (default),
+   *       falling back to client-side deletion (all objects first, then native folders deepest to
+   *       shallowest) only if the server rejects the initial request as unimplemented ({@code
+   *       UNIMPLEMENTED}) before accepting a long-running operation. If waiting for an accepted
+   *       {@code DeleteFolderRecursive} operation times out, fails polling, or is interrupted,
+   *       {@link IOException} or {@link InterruptedIOException} is thrown naming the operation
+   *       while the server may continue deleting asynchronously; a concurrent {@code NOT_FOUND}
+   *       while another recursive delete of the same folder is in flight returns normally. Callers
+   *       that require strictly synchronous client-side deletion can set {@code
+   *       analytics-core.hierarchical.namespace.server-side-recursive-delete.enable=false}.
+   *   <li><b>Bucket</b>: verifies emptiness (non-recursive) or deletes all objects and folders in
+   *       the bucket (recursive), and calls {@link GcsClient#deleteBucket(GcsItemId)} only when
+   *       {@link GcsFileSystemOptions#isBucketDeleteEnabled()} is {@code true} (default {@code
+   *       false}); otherwise bucket deletion is skipped with an info log.
+   *   <li><b>Flat implicit parent repair</b>: on flat-namespace buckets when {@link
+   *       GcsFileSystemOptions#isAutoRepairImplicitDirectoriesEnabled()} is {@code true} (default),
+   *       performs a best-effort check and creates a 0-byte placeholder marker for the immediate
+   *       parent directory (if not root, bucket, or malformed/dot-segment path) so the parent
+   *       remains visible; repair errors are logged and never fail an already-completed delete.
+   * </ul>
+   *
+   * <p>A bucket is deleted as an HNS bucket only when {@link
+   * GcsFileSystemOptions#isHnsApiEnabled()} is {@code true} and the bucket metadata lookup ({@code
+   * storage.buckets.get}) succeeds; {@code 401}/{@code 403} falls back to flat. When an HNS bucket
+   * is treated as flat, empty native folders without objects cannot be found or deleted, and
+   * directory deletes follow flat placeholder semantics.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}, so that
+   * implementations written against earlier versions of this interface keep compiling; {@link
+   * GcsFileSystemImpl} overrides it.
+   *
+   * @param itemId the GCS item identifier of the object, directory, or bucket to delete; any
+   *     content generation is ignored
+   * @param recursive if {@code true} and {@code itemId} is a directory or bucket, recursively
+   *     deletes all contained objects and subdirectories; if {@code false}, fails with {@link
+   *     DirectoryNotEmptyException} when non-empty
+   * @throws NullPointerException if {@code itemId} is {@code null}
+   * @throws IllegalArgumentException if {@code itemId} is {@link GcsItemId#ROOT} or has an empty
+   *     bucket name
+   * @throws FileNotFoundException if nothing exists at {@code itemId}
+   * @throws DirectoryNotEmptyException if {@code recursive} is {@code false} and the target
+   *     directory or bucket is not empty
+   * @throws AccessDeniedException if the caller lacks required GCS permissions
+   * @throws InterruptedIOException if the calling thread is interrupted before or while deleting,
+   *     or while waiting on a long-running operation (its interrupt status stays set)
+   * @throws UnsupportedOperationException if this implementation does not support deleting items
+   * @throws IOException if an I/O error occurs
+   */
+  default void delete(GcsItemId itemId, boolean recursive) throws IOException {
+    throw new UnsupportedOperationException("delete is not supported by " + getClass().getName());
   }
 }

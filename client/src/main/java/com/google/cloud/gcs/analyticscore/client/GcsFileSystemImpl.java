@@ -49,10 +49,12 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -155,8 +157,9 @@ public class GcsFileSystemImpl implements GcsFileSystem {
                     telemetry,
                     cacheManager.getBucketPropertiesCache(),
                     fileSystemOptions.getGcsAuthOptions()));
-    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient);
-    this.hnsStrategy = new HierarchicalNamespaceStrategyImpl(this.gcsClient);
+    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
+    this.hnsStrategy =
+        new HierarchicalNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
   }
 
   private static Credentials createCredentials(GcsFileSystemOptions fileSystemOptions) {
@@ -188,8 +191,9 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     this.statusExecutorServiceSupplier = initializeStatusExecutionServiceSupplier();
     this.telemetry = telemetry;
     this.cacheManager = cacheManager;
-    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient);
-    this.hnsStrategy = new HierarchicalNamespaceStrategyImpl(this.gcsClient);
+    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
+    this.hnsStrategy =
+        new HierarchicalNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
   }
 
   @VisibleForTesting
@@ -266,7 +270,7 @@ public class GcsFileSystemImpl implements GcsFileSystem {
         "Expected a bucket, directory or object but got: %s",
         itemId);
     // Listing ignores content generation; strip it once so lookups and error messages omit it.
-    GcsItemId targetId = withoutContentGeneration(itemId);
+    GcsItemId targetId = UriUtil.withoutContentGeneration(itemId);
     // Checked here, before any request: a listing handed to the status executor would not see the
     // interrupt of this thread, and a finished lookup returns without checking for it.
     if (Thread.currentThread().isInterrupted()) {
@@ -298,15 +302,6 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     }
     StartedDirectoryListing started = getFromFuture(firstPageFuture);
     return toSortedFileInfos(started.complete(targetId));
-  }
-
-  private static GcsItemId withoutContentGeneration(GcsItemId itemId) {
-    if (itemId.getContentGeneration().isEmpty()) {
-      return itemId;
-    }
-    GcsItemId.Builder builder = GcsItemId.builder().setBucketName(itemId.getBucketName());
-    itemId.getObjectName().ifPresent(builder::setObjectName);
-    return builder.build();
   }
 
   private List<GcsItemInfo> listDirectory(GcsItemId itemId) throws IOException {
@@ -354,18 +349,31 @@ public class GcsFileSystemImpl implements GcsFileSystem {
       throws IOException {
     checkNotNull(itemId, "itemId should not be null");
     PathType pathType = itemId.resolvePathType();
-
     if (pathType == PathType.ROOT) {
       return GcsFileInfo.ROOT_INFO;
     }
+    GcsItemInfo itemInfo = getItemInfoInternal(itemId, inferImplicitDirectories);
+    if (pathType == PathType.BUCKET) {
+      return createBucketFileInfo(itemInfo);
+    }
+    return toGcsFileInfo(itemInfo);
+  }
+
+  private GcsItemInfo getItemInfoInternal(GcsItemId itemId, boolean inferImplicitDirectories)
+      throws IOException {
+    checkNotNull(itemId, "itemId should not be null");
+    PathType pathType = itemId.resolvePathType();
+
+    if (pathType == PathType.ROOT) {
+      return GcsItemInfo.ROOT_INFO;
+    }
 
     if (pathType == PathType.BUCKET) {
-      GcsItemInfo bucketInfo = gcsClient.getBucketInfo(itemId);
-      return createBucketFileInfo(bucketInfo);
+      return gcsClient.getBucketInfo(itemId);
     }
 
     if (pathType == PathType.DIRECTORY) {
-      return toGcsFileInfo(lookupDirectoryInfo(itemId, inferImplicitDirectories));
+      return lookupDirectoryInfo(itemId, inferImplicitDirectories);
     }
 
     // Submit directory info in background
@@ -374,21 +382,22 @@ public class GcsFileSystemImpl implements GcsFileSystem {
         statusExecutorService.submit(() -> lookupDirectoryInfo(itemId, inferImplicitDirectories));
 
     // Perform direct object metadata lookup
+    boolean awaitDirectory = false;
     try {
-      GcsItemInfo itemInfo = gcsClient.getGcsItemInfo(itemId);
-      directoryInfoFuture.cancel(true);
-      return toGcsFileInfo(itemInfo);
+      return gcsClient.getGcsItemInfo(itemId);
     } catch (FileNotFoundException ignored) {
       // Direct object not found; fall through to directory info
       LOG.debug("Item '{}' not found directly, checking for directory existence.", itemId);
-    } catch (Exception e) {
-      directoryInfoFuture.cancel(true);
-      throw e;
+      awaitDirectory = true;
+    } finally {
+      if (!awaitDirectory) {
+        directoryInfoFuture.cancel(true);
+      }
     }
 
     // Await directory info and return (unwraps ExecutionException to FileNotFoundException /
     // IOException)
-    return toGcsFileInfo(getFromFuture(directoryInfoFuture));
+    return getFromFuture(directoryInfoFuture);
   }
 
   private GcsItemInfo lookupDirectoryInfo(GcsItemId itemId, boolean inferImplicitDirectories)
@@ -523,6 +532,120 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     }
 
     strategy.createDirectory(dirItemId);
+  }
+
+  @Override
+  public void delete(GcsItemId itemId, boolean recursive) throws IOException {
+    checkNotNull(itemId, "itemId should not be null");
+    checkArgument(!itemId.isRoot(), "Cannot delete root path (%s)", UriUtil.getStringPath(itemId));
+    checkArgument(!itemId.getBucketName().isEmpty(), "Bucket name must not be empty: %s", itemId);
+    // Delete ignores caller-supplied content generation; strip it once so lookups and error
+    // messages omit it while live lookup/listing generations still guard object deletes.
+    GcsItemId targetId = UriUtil.withoutContentGeneration(itemId);
+    NamespaceStrategy.checkNotInterrupted(targetId);
+
+    GcsItemInfo itemInfo = getItemInfoInternal(targetId, /* inferImplicitDirectories= */ true);
+    GcsItemId resolvedId = itemInfo.getItemId();
+    NamespaceStrategy strategy = resolveStrategy(resolvedId.getBucketName());
+
+    GcsItemId parentToRepair = null;
+    Future<Optional<GcsItemInfo>> parentProbeFuture = null;
+    if (!resolvedId.isBucket()
+        && strategy.shouldRepairImplicitParentDirectory()
+        && fileSystemOptions.isAutoRepairImplicitDirectoriesEnabled()) {
+      Optional<GcsItemId> parentOpt = UriUtil.getParentId(resolvedId);
+      if (parentOpt.isPresent() && parentOpt.get().isGcsObject()) {
+        String parentName = parentOpt.get().getObjectName().orElse("");
+        if (!parentName.startsWith(PATH_DELIMITER)
+            && !parentName.contains(PATH_DELIMITER + PATH_DELIMITER)
+            && !UriUtil.hasDotSegment(parentName)) {
+          parentToRepair = parentOpt.get();
+          GcsItemId parentId = parentToRepair;
+          try {
+            parentProbeFuture =
+                statusExecutorServiceSupplier
+                    .get()
+                    .submit(
+                        () ->
+                            lookupDirectoryInfoOptional(
+                                strategy, parentId, /* inferImplicitDirectories= */ false));
+          } catch (RejectedExecutionException e) {
+            LOG.warn(
+                "Skipping implicit parent directory repair in bucket {} because executor is shut"
+                    + " down",
+                parentId.getBucketName());
+            LOG.debug(
+                "Skipped implicit parent directory repair for {}",
+                UriUtil.getStringPath(parentId),
+                e);
+          }
+        }
+      }
+    }
+
+    boolean deleted = false;
+    try {
+      if (itemInfo.getItemType() == GcsItemInfo.ItemType.BUCKET) {
+        strategy.deleteBucketContents(resolvedId, recursive);
+        if (fileSystemOptions.isBucketDeleteEnabled()) {
+          NamespaceStrategy.checkNotInterrupted(resolvedId);
+          gcsClient.deleteBucket(resolvedId);
+        } else {
+          LOG.info(
+              "Skipping deletion of bucket {} because bucket delete is disabled",
+              resolvedId.getBucketName());
+        }
+      } else if (itemInfo.getItemType() == GcsItemInfo.ItemType.OBJECT) {
+        NamespaceStrategy.checkNotInterrupted(resolvedId);
+        gcsClient.deleteObject(NamespaceStrategy.itemIdWithPositiveGeneration(itemInfo));
+      } else {
+        strategy.deleteDirectory(itemInfo, recursive);
+      }
+      deleted = true;
+    } finally {
+      if (!deleted && parentProbeFuture != null) {
+        parentProbeFuture.cancel(true);
+      }
+    }
+
+    if (parentProbeFuture != null) {
+      repairImplicitParentDirectory(parentToRepair, parentProbeFuture);
+    }
+  }
+
+  private static Optional<GcsItemInfo> lookupDirectoryInfoOptional(
+      NamespaceStrategy strategy, GcsItemId dirId, boolean inferImplicitDirectories)
+      throws IOException {
+    try {
+      return Optional.of(strategy.getDirectoryInfo(dirId, inferImplicitDirectories));
+    } catch (FileNotFoundException e) {
+      return Optional.empty();
+    }
+  }
+
+  private void repairImplicitParentDirectory(
+      GcsItemId parentId, Future<Optional<GcsItemInfo>> parentProbeFuture) {
+    try {
+      Optional<GcsItemInfo> existingParent = getFromFuture(parentProbeFuture);
+      if (existingParent.isEmpty()) {
+        gcsClient.createEmptyObject(parentId);
+      }
+    } catch (InterruptedIOException e) {
+      // Preserve the interrupt status without failing an already-completed delete.
+      Thread.currentThread().interrupt();
+      LOG.warn(
+          "Interrupted while repairing implicit parent directory in bucket {}",
+          parentId.getBucketName());
+      LOG.debug(
+          "Interrupted while repairing implicit parent directory {}",
+          UriUtil.getStringPath(parentId),
+          e);
+    } catch (IOException | RuntimeException e) {
+      // Log only the bucket at WARN: directory names may contain sensitive data.
+      LOG.warn("Failed to repair implicit parent directory in bucket {}", parentId.getBucketName());
+      LOG.debug(
+          "Failed to repair implicit parent directory {}", UriUtil.getStringPath(parentId), e);
+    }
   }
 
   @VisibleForTesting

@@ -20,8 +20,10 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Strategy interface for handling directory operations across different namespace models (Flat vs.
@@ -79,6 +81,16 @@ interface NamespaceStrategy {
   }
 
   /**
+   * Minimal field projection used when recursively listing objects for deletion. Requests only
+   * object names and content generations so {@link GcsClient#deleteObject(GcsItemId)} can enforce
+   * generation-match preconditions while minimizing listing payload size.
+   */
+  GcsListOptions DELETE_LIST_OPTIONS =
+      GcsListOptions.LIST_RECURSIVE.toBuilder()
+          .setFields(GcsListOptions.ListField.NAME, GcsListOptions.ListField.GENERATION)
+          .build();
+
+  /**
    * Retrieves directory metadata for the given {@link GcsItemId}.
    *
    * @param id the item identifier for the directory
@@ -128,4 +140,68 @@ interface NamespaceStrategy {
    */
   List<GcsItemInfo> completeDirectoryListing(GcsItemId id, GcsListPage<GcsItemInfo> firstPage)
       throws IOException;
+
+  /**
+   * Returns {@code true} if deleting an object or directory under this namespace model may require
+   * creating a 0-byte placeholder marker for its immediate parent directory so the parent remains
+   * observable.
+   */
+  boolean shouldRepairImplicitParentDirectory();
+
+  /**
+   * Deletes the directory described by {@code dirInfo}.
+   *
+   * @param dirInfo metadata for the existing directory to delete
+   * @param recursive if {@code true}, deletes all nested objects and subdirectories; if {@code
+   *     false}, throws {@link DirectoryNotEmptyException} when the directory is not empty
+   * @throws DirectoryNotEmptyException if {@code recursive} is {@code false} and the directory is
+   *     not empty
+   * @throws IOException if an I/O error occurs
+   */
+  void deleteDirectory(GcsItemInfo dirInfo, boolean recursive) throws IOException;
+
+  /**
+   * Verifies emptiness of (when {@code recursive} is {@code false}) or deletes all contents inside
+   * (when {@code recursive} is {@code true}) the bucket identified by {@code bucketId}, without
+   * deleting the bucket resource itself.
+   *
+   * @param bucketId the bucket identifier
+   * @param recursive if {@code true}, deletes all objects and folders in the bucket; if {@code
+   *     false}, throws {@link DirectoryNotEmptyException} when the bucket is not empty
+   * @throws DirectoryNotEmptyException if {@code recursive} is {@code false} and the bucket is not
+   *     empty
+   * @throws IOException if an I/O error occurs
+   */
+  void deleteBucketContents(GcsItemId bucketId, boolean recursive) throws IOException;
+
+  /**
+   * Throws {@link InterruptedIOException} (preserving the thread's interrupt status) if the current
+   * thread has been interrupted while deleting {@code itemId}.
+   */
+  static void checkNotInterrupted(GcsItemId itemId) throws InterruptedIOException {
+    if (Thread.currentThread().isInterrupted()) {
+      throw new InterruptedIOException(
+          "Interrupted while deleting: " + UriUtil.getStringPath(itemId));
+    }
+  }
+
+  /**
+   * Returns an identifier for {@code itemInfo} carrying a positive content generation if known from
+   * either {@link GcsItemInfo#getItemId()} or {@link GcsItemInfo#getContentGeneration()}, or
+   * without any generation otherwise (stripping non-positive generations).
+   */
+  static GcsItemId itemIdWithPositiveGeneration(GcsItemInfo itemInfo) {
+    GcsItemId itemId = itemInfo.getItemId();
+    if (itemId.getContentGeneration().filter(gen -> gen > 0L).isPresent()) {
+      return itemId;
+    }
+    Optional<Long> infoGen = itemInfo.getContentGeneration().filter(gen -> gen > 0L);
+    if (infoGen.isPresent()) {
+      GcsItemId.Builder builder = GcsItemId.builder().setBucketName(itemId.getBucketName());
+      itemId.getObjectName().ifPresent(builder::setObjectName);
+      builder.setContentGeneration(infoGen.get());
+      return builder.build();
+    }
+    return UriUtil.withoutContentGeneration(itemId);
+  }
 }

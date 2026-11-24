@@ -85,6 +85,9 @@ class GcsFileSystemOptionsTest {
     assertThat(options.getReadThreadCount()).isEqualTo(16);
     assertThat(options.isHnsApiEnabled()).isTrue();
     assertThat(options.isCreateItemsConflictCheckEnabled()).isTrue();
+    assertThat(options.isAutoRepairImplicitDirectoriesEnabled()).isTrue();
+    assertThat(options.isBucketDeleteEnabled()).isFalse();
+    assertThat(options.isHnsServerSideRecursiveDeleteEnabled()).isTrue();
 
     GcsCacheOptions cacheOptions = options.getGcsCacheOptions();
     assertThat(cacheOptions.isFooterCacheEnabled()).isFalse();
@@ -162,6 +165,10 @@ class GcsFileSystemOptionsTest {
     properties.put("fs.gs.analytics-core.hierarchical.namespace.enable", null);
     properties.put("fs.gs.analytics-core.metadata.lookup.parallel.enable", "  ");
     properties.put("fs.gs.analytics-core.create.items.conflict.check.enable", "");
+    properties.put("fs.gs.analytics-core.directory.implicit-repair.enable", "  ");
+    properties.put("fs.gs.analytics-core.bucket.delete.enable", null);
+    properties.put(
+        "fs.gs.analytics-core.hierarchical.namespace.server-side-recursive-delete.enable", "");
 
     // Act
     GcsFileSystemOptions options = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
@@ -172,6 +179,34 @@ class GcsFileSystemOptionsTest {
     assertThat(options.isHnsApiEnabled()).isTrue();
     assertThat(options.isMetadataLookupParallelEnabled()).isTrue();
     assertThat(options.isCreateItemsConflictCheckEnabled()).isTrue();
+    assertThat(options.isAutoRepairImplicitDirectoriesEnabled()).isTrue();
+    assertThat(options.isBucketDeleteEnabled()).isFalse();
+    assertThat(options.isHnsServerSideRecursiveDeleteEnabled()).isTrue();
+  }
+
+  @Test
+  void createFromOptions_withDeleteOptionsSet_parsesExplicitValues() {
+    // Arrange
+    ImmutableMap<String, String> properties =
+        ImmutableMap.of(
+            "fs.gs.analytics-core.directory.implicit-repair.enable", " false ",
+            "fs.gs.analytics-core.bucket.delete.enable", " TRUE ",
+            "fs.gs.analytics-core.hierarchical.namespace.server-side-recursive-delete.enable",
+                " false ");
+
+    // Act
+    GcsFileSystemOptions options = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+
+    // Assert
+    assertThat(options.isAutoRepairImplicitDirectoriesEnabled()).isFalse();
+    assertThat(options.isBucketDeleteEnabled()).isTrue();
+    assertThat(options.isHnsServerSideRecursiveDeleteEnabled()).isFalse();
+  }
+
+  @Test
+  void publicSignatures_containNoGuavaTypes() {
+    ApiSignatureTestUtils.assertNoGuavaTypesInSignatures(
+        GcsFileSystemOptions.class, GcsFileSystemOptions.Builder.class);
   }
 
   @Test
