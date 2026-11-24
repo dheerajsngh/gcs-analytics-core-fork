@@ -125,11 +125,13 @@ These settings control how many times the underlying Cloud Storage client retrie
 
 ### Directory Operations
 
-These settings control how `mkdirs` creates directories.
+These settings control directory creation (`mkdirs`) and directory rename behavior.
 
 | Property | Description | Default Value |
 | :--- | :--- | :--- |
 | `analytics-core.create.items.conflict.check.enable` | Before `mkdirs` creates a directory, checks that no file exists at the target path or any of its parent paths, with one `storage.objects.get` request per path level. The check is best-effort: it isn't atomic with concurrent writes, and it skips paths that the caller can't read. | `true` |
+| `analytics-core.directory.implicit-repair.enable` | On flat-namespace buckets, automatically creates an explicit 0-byte directory marker for the source's immediate parent directory after `rename` if it was an implicit directory. Repair is best-effort and skipped on hierarchical namespace (HNS) buckets. | `true` |
+| `analytics-core.directory.marker-file-pattern` | Regular expression matching relative filenames (for example, `_SUCCESS`) that are moved in a second phase after all non-marker files during flat-namespace directory renames. Compiled as `^(.+/)?(?:<pattern>)$` and matched against the relative path under the renamed source directory. Ignored on hierarchical namespace (HNS) buckets, which rename folders atomically. | - |
 
 ### Telemetry and Monitoring
 

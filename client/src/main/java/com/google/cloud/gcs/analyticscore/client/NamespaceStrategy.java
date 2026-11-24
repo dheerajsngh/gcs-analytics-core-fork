@@ -31,7 +31,6 @@ import java.util.List;
  *
  * <ul>
  *   <li>{@code boolean isDirectoryEmpty(GcsItemId id) throws IOException;}
- *   <li>{@code void renameDirectory(GcsItemId src, GcsItemId dst) throws IOException;}
  *   <li>{@code java.util.List<GcsItemInfo> listRecursive(GcsItemId id) throws IOException;}
  * </ul>
  */
@@ -128,4 +127,23 @@ interface NamespaceStrategy {
    */
   List<GcsItemInfo> completeDirectoryListing(GcsItemId id, GcsListPage<GcsItemInfo> firstPage)
       throws IOException;
+
+  /**
+   * Returns whether implicit parent directory repair applies after mutating operations (such as
+   * rename) on buckets managed by this strategy.
+   *
+   * <p>Flat-namespace buckets need explicit 0-byte marker repair when moving children out of an
+   * implicit parent directory; HNS buckets maintain native folder resources automatically.
+   */
+  boolean shouldRepairImplicitParentDirectory();
+
+  /**
+   * Renames an existing directory (and all of its contents) to a non-existent destination directory
+   * within the same bucket.
+   *
+   * @param srcDirId the existing source directory identifier
+   * @param dstDirId the target destination directory identifier
+   * @throws IOException if the directory cannot be renamed
+   */
+  void renameDirectory(GcsItemId srcDirId, GcsItemId dstDirId) throws IOException;
 }

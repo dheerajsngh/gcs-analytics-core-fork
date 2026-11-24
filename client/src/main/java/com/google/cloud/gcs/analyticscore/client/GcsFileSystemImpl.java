@@ -44,18 +44,22 @@ import java.net.URI;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -155,8 +159,9 @@ public class GcsFileSystemImpl implements GcsFileSystem {
                     telemetry,
                     cacheManager.getBucketPropertiesCache(),
                     fileSystemOptions.getGcsAuthOptions()));
-    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient);
-    this.hnsStrategy = new HierarchicalNamespaceStrategyImpl(this.gcsClient);
+    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
+    this.hnsStrategy =
+        new HierarchicalNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
   }
 
   private static Credentials createCredentials(GcsFileSystemOptions fileSystemOptions) {
@@ -188,8 +193,9 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     this.statusExecutorServiceSupplier = initializeStatusExecutionServiceSupplier();
     this.telemetry = telemetry;
     this.cacheManager = cacheManager;
-    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient);
-    this.hnsStrategy = new HierarchicalNamespaceStrategyImpl(this.gcsClient);
+    this.flatStrategy = new FlatNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
+    this.hnsStrategy =
+        new HierarchicalNamespaceStrategyImpl(this.gcsClient, this.fileSystemOptions);
   }
 
   @VisibleForTesting
@@ -266,7 +272,7 @@ public class GcsFileSystemImpl implements GcsFileSystem {
         "Expected a bucket, directory or object but got: %s",
         itemId);
     // Listing ignores content generation; strip it once so lookups and error messages omit it.
-    GcsItemId targetId = withoutContentGeneration(itemId);
+    GcsItemId targetId = UriUtil.withoutContentGeneration(itemId);
     // Checked here, before any request: a listing handed to the status executor would not see the
     // interrupt of this thread, and a finished lookup returns without checking for it.
     if (Thread.currentThread().isInterrupted()) {
@@ -298,15 +304,6 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     }
     StartedDirectoryListing started = getFromFuture(firstPageFuture);
     return toSortedFileInfos(started.complete(targetId));
-  }
-
-  private static GcsItemId withoutContentGeneration(GcsItemId itemId) {
-    if (itemId.getContentGeneration().isEmpty()) {
-      return itemId;
-    }
-    GcsItemId.Builder builder = GcsItemId.builder().setBucketName(itemId.getBucketName());
-    itemId.getObjectName().ifPresent(builder::setObjectName);
-    return builder.build();
   }
 
   private List<GcsItemInfo> listDirectory(GcsItemId itemId) throws IOException {
@@ -523,6 +520,614 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     }
 
     strategy.createDirectory(dirItemId);
+  }
+
+  @Override
+  public void rename(GcsItemId src, GcsItemId dst) throws IOException {
+    checkNotNull(src, "src should not be null");
+    checkNotNull(dst, "dst should not be null");
+    checkArgument(!src.isRoot(), "Root path cannot be renamed.");
+    checkArgument(
+        src.isBucket() || src.isGcsObject(),
+        "Expected a bucket or GCS object for src, but got: %s",
+        src);
+    checkArgument(
+        dst.isRoot() || dst.isBucket() || dst.isGcsObject(),
+        "Expected root, bucket, or GCS object for dst, but got: %s",
+        dst);
+    if (dst.isGcsObject()) {
+      String dstObjectName = dst.getObjectName().get();
+      checkArgument(
+          !dstObjectName.startsWith(PATH_DELIMITER)
+              && !dstObjectName.contains(PATH_DELIMITER + PATH_DELIMITER),
+          "Destination object name cannot start with '/' or contain consecutive '/': %s",
+          dst);
+    }
+
+    if (src.isBucket()) {
+      throw new UnsupportedOperationException(
+          "Renaming a bucket is not supported: " + UriUtil.getStringPath(src));
+    }
+    if (!dst.isRoot() && UriUtil.hasDotSegment(dst.getObjectName().orElse(""))) {
+      throw new IOException(
+          String.format(
+              "Refusing to rename '%s' to '%s': destination contains '.' or '..' path segment",
+              UriUtil.getStringPath(src), UriUtil.getStringPath(dst)));
+    }
+    if (!dst.isRoot() && !src.getBucketName().equals(dst.getBucketName())) {
+      throw new UnsupportedOperationException(
+          String.format(
+              "Cross-bucket rename is not supported: '%s' to '%s'",
+              UriUtil.getStringPath(src), UriUtil.getStringPath(dst)));
+    }
+
+    GcsItemId srcLookupId = UriUtil.withoutContentGeneration(src);
+    GcsItemId dstLookupId = UriUtil.withoutContentGeneration(dst);
+    NamespaceStrategy strategy = resolveStrategy(srcLookupId.getBucketName());
+    RenameMetadata metadata = lookupRenameTargets(strategy, srcLookupId, dstLookupId);
+
+    GcsItemId srcId = UriUtil.withoutContentGeneration(metadata.srcInfo.getItemInfo().getItemId());
+    boolean srcIsDir = isDirectory(metadata.srcInfo.getItemInfo());
+    GcsItemId resolvedDst = resolveRenameDestination(srcId, srcIsDir, metadata);
+
+    if (srcId.equals(resolvedDst)) {
+      return;
+    }
+    if (metadata.dstExists) {
+      checkResolvedDestinationDoesNotExist(strategy, resolvedDst);
+    }
+
+    GcsItemId srcParentToRepair = null;
+    Future<Optional<GcsItemInfo>> srcParentProbeFuture = null;
+    if (strategy.shouldRepairImplicitParentDirectory()
+        && fileSystemOptions.isAutoRepairImplicitDirectoriesEnabled()) {
+      Optional<GcsItemId> srcParentOpt = UriUtil.getParentId(srcId);
+      if (srcParentOpt.isPresent() && srcParentOpt.get().isGcsObject()) {
+        GcsItemId parentId = srcParentOpt.get();
+        String parentName = parentId.getObjectName().orElse("");
+        if (!parentName.startsWith(PATH_DELIMITER)
+            && !parentName.contains(PATH_DELIMITER + PATH_DELIMITER)
+            && !UriUtil.hasDotSegment(parentName)) {
+          srcParentToRepair = parentId;
+          try {
+            srcParentProbeFuture =
+                statusExecutorServiceSupplier
+                    .get()
+                    .submit(
+                        () ->
+                            lookupDirectoryInfoOptional(
+                                strategy, parentId, /* inferImplicitDirectories= */ false));
+          } catch (RejectedExecutionException e) {
+            LOG.warn(
+                "Skipping implicit parent directory repair in bucket {} because executor is shut"
+                    + " down",
+                parentId.getBucketName());
+            LOG.debug(
+                "Skipped implicit parent directory repair for {}",
+                UriUtil.getStringPath(parentId),
+                e);
+          }
+        }
+      }
+    }
+
+    try {
+      if (srcIsDir) {
+        strategy.renameDirectory(srcId, resolvedDst);
+      } else {
+        moveObjectWithRetryRecovery(gcsClient, metadata.srcInfo.getItemInfo(), resolvedDst);
+      }
+    } catch (Throwable t) {
+      cancelIfPresent(srcParentProbeFuture);
+      throw t;
+    }
+
+    if (srcParentProbeFuture != null) {
+      repairImplicitParentDirectory(srcParentToRepair, srcParentProbeFuture);
+    }
+  }
+
+  private RenameMetadata lookupRenameTargets(
+      NamespaceStrategy strategy, GcsItemId srcLookupId, GcsItemId dstLookupId) throws IOException {
+    Optional<GcsItemId> dstParentOpt = UriUtil.getParentId(dstLookupId);
+    ExecutorService statusExecutor = statusExecutorServiceSupplier.get();
+
+    Future<Optional<GcsItemInfo>> dstParentFuture = null;
+    Future<Optional<GcsItemInfo>> dstObjFuture = null;
+    Future<Optional<GcsItemInfo>> dstDirFuture = null;
+    GcsItemId nonDirDstId = null;
+    try {
+      // Submit only leaf, non-reentrant RPC tasks onto statusExecutor so worker threads can never
+      // block awaiting other tasks in the same pool. Skip getBucketInfo when dst or dstParent is
+      // src's bucket to preserve object-only IAM / CAB compatibility.
+      if (dstParentOpt.isPresent() && dstParentOpt.get().isGcsObject()) {
+        GcsItemId dstParentDirId = dstParentOpt.get().toDirectoryId();
+        dstParentFuture =
+            statusExecutor.submit(
+                () ->
+                    lookupDirectoryInfoOptional(
+                        strategy, dstParentDirId, /* inferImplicitDirectories= */ true));
+      }
+      if (dstLookupId.isGcsObject()) {
+        if (dstLookupId.resolvePathType() == PathType.DIRECTORY) {
+          dstDirFuture =
+              statusExecutor.submit(
+                  () ->
+                      lookupDirectoryInfoOptional(
+                          strategy, dstLookupId, /* inferImplicitDirectories= */ true));
+          String nonDirName =
+              UriUtil.removeTrailingSlash(dstLookupId.getObjectName().orElseThrow());
+          if (!nonDirName.isEmpty() && !nonDirName.endsWith(PATH_DELIMITER)) {
+            GcsItemId strippedDstId =
+                GcsItemId.builder()
+                    .setBucketName(dstLookupId.getBucketName())
+                    .setObjectName(nonDirName)
+                    .build();
+            nonDirDstId = strippedDstId;
+            dstObjFuture = statusExecutor.submit(() -> lookupObjectInfoOptional(strippedDstId));
+          }
+        } else {
+          dstObjFuture = statusExecutor.submit(() -> lookupObjectInfoOptional(dstLookupId));
+          dstDirFuture =
+              statusExecutor.submit(
+                  () ->
+                      lookupDirectoryInfoOptional(
+                          strategy, dstLookupId, /* inferImplicitDirectories= */ true));
+        }
+      }
+
+      GcsFileInfo srcInfo = getFileInfo(srcLookupId);
+      boolean srcIsDir = isDirectory(srcInfo.getItemInfo());
+
+      Optional<GcsItemInfo> dstInfo;
+      boolean dstExists;
+      Optional<GcsItemId> dstConflictingFileId = Optional.empty();
+      if (dstLookupId.isRoot() || dstLookupId.isBucket()) {
+        dstInfo = Optional.empty();
+        dstExists = true;
+      } else if (dstLookupId.resolvePathType() == PathType.DIRECTORY) {
+        dstInfo = getFromFuture(dstDirFuture);
+        dstExists = dstInfo.isPresent();
+        if (dstExists || !srcIsDir) {
+          cancelIfPresent(dstObjFuture);
+        } else if (dstObjFuture != null) {
+          try {
+            dstConflictingFileId =
+                getFromFuture(dstObjFuture)
+                    .map(info -> UriUtil.withoutContentGeneration(info.getItemId()));
+          } catch (AccessDeniedException e) {
+            // The non-directory probe is best-effort under prefix-scoped Credential Access
+            // Boundaries, where objects/<dir>/ is allowed but objects/<dir> is outside the rule.
+            LOG.warn(
+                "Skipping conflicting-file check for trailing-slash rename destination in bucket {}"
+                    + " because the caller cannot read the non-directory path",
+                dstLookupId.getBucketName());
+            LOG.debug(
+                "Conflicting-file check access denied for '{}'",
+                UriUtil.getStringPath(nonDirDstId),
+                e);
+            dstConflictingFileId = Optional.empty();
+          }
+        }
+      } else if (dstObjFuture != null) {
+        Optional<GcsItemInfo> objInfo = getFromFuture(dstObjFuture);
+        if (objInfo.isPresent()) {
+          cancelIfPresent(dstDirFuture);
+          dstInfo = objInfo;
+        } else {
+          dstInfo = getFromFuture(dstDirFuture);
+        }
+        dstExists = dstInfo.isPresent();
+      } else {
+        dstInfo = getFromFuture(dstDirFuture);
+        dstExists = dstInfo.isPresent();
+      }
+
+      GcsItemId resolvedDstLookupId =
+          dstInfo
+              .map(info -> UriUtil.withoutContentGeneration(info.getItemId()))
+              .orElse(dstLookupId);
+      boolean dstIsDir =
+          dstInfo.map(GcsFileSystemImpl::isDirectory).orElse(dstLookupId.isDirectory());
+
+      // If dst (or a conflicting file at dst without trailing slash) already exists, its parent
+      // necessarily exists in GCS; only await dstParentFuture otherwise.
+      boolean dstParentExists =
+          dstExists
+              || dstConflictingFileId.isPresent()
+              || dstParentFuture == null
+              || getFromFuture(dstParentFuture).isPresent();
+
+      return new RenameMetadata(
+          srcInfo,
+          resolvedDstLookupId,
+          dstExists,
+          dstIsDir,
+          dstConflictingFileId,
+          dstParentOpt,
+          dstParentExists);
+    } finally {
+      cancelIfPresent(dstParentFuture);
+      cancelIfPresent(dstObjFuture);
+      cancelIfPresent(dstDirFuture);
+    }
+  }
+
+  private GcsItemId resolveRenameDestination(
+      GcsItemId srcId, boolean srcIsDir, RenameMetadata metadata) throws IOException {
+    GcsItemId dstId = metadata.dstId;
+    if (!srcIsDir && dstId.isRoot()) {
+      throw new IOException("A file cannot be created in root.");
+    }
+    if (metadata.dstExists && !metadata.dstIsDir && (srcIsDir || !dstId.equals(srcId))) {
+      throw new FileAlreadyExistsException(
+          UriUtil.getStringPath(dstId), null, "Cannot overwrite an existing file");
+    }
+    if (srcIsDir && !metadata.dstExists && metadata.dstConflictingFileId.isPresent()) {
+      throw GcsExceptionUtil.createFileAlreadyExistsException(
+          dstId.toDirectoryId(),
+          metadata.dstConflictingFileId.orElseThrow(),
+          "Cannot overwrite an existing file");
+    }
+    if (!metadata.dstParentExists) {
+      throw new FileNotFoundException(
+          "Cannot rename because destination parent does not exist: "
+              + UriUtil.getStringPath(metadata.dstParentOpt.orElseThrow()));
+    }
+
+    String srcLeafName = UriUtil.getLeafName(srcId).orElse("");
+    if (srcIsDir) {
+      GcsItemId dstDirId = dstId.toDirectoryId();
+      if (srcId.equals(dstDirId)) {
+        throw new IOException("Rename dir to self is forbidden: " + UriUtil.getStringPath(srcId));
+      }
+      if (UriUtil.isSubdirectory(srcId, dstDirId)) {
+        throw new IOException(
+            String.format(
+                "Rename to subdir is forbidden: '%s' to '%s'",
+                UriUtil.getStringPath(srcId), UriUtil.getStringPath(dstDirId)));
+      }
+      if (metadata.dstExists) {
+        if (dstDirId.isRoot()) {
+          throw new UnsupportedOperationException(
+              "Cannot rename directory into root: " + UriUtil.getStringPath(srcId));
+        }
+        return UriUtil.resolveChildId(dstDirId, srcLeafName, srcId, /* isDirectory= */ true);
+      }
+      return dstDirId;
+    }
+
+    if (dstId.isDirectory()) {
+      if (!metadata.dstExists) {
+        throw new FileNotFoundException(
+            "Cannot rename because path does not exist: " + UriUtil.getStringPath(dstId));
+      }
+      return UriUtil.resolveChildId(dstId, srcLeafName, srcId, /* isDirectory= */ false);
+    }
+    return dstId;
+  }
+
+  private void checkResolvedDestinationDoesNotExist(
+      NamespaceStrategy strategy, GcsItemId resolvedDst) throws IOException {
+    if (resolvedDst.isDirectory()) {
+      String nonDirName = UriUtil.removeTrailingSlash(resolvedDst.getObjectName().get());
+      GcsItemId nonDirId =
+          GcsItemId.builder()
+              .setBucketName(resolvedDst.getBucketName())
+              .setObjectName(nonDirName)
+              .build();
+      Future<Optional<GcsItemInfo>> nonDirFuture =
+          statusExecutorServiceSupplier.get().submit(() -> lookupObjectInfoOptional(nonDirId));
+      boolean awaitNonDir = false;
+      try {
+        Optional<GcsItemInfo> dirInfo =
+            lookupDirectoryInfoOptional(
+                strategy, resolvedDst, /* inferImplicitDirectories= */ true);
+        if (dirInfo.isPresent()) {
+          GcsItemId existingId = UriUtil.withoutContentGeneration(dirInfo.get().getItemId());
+          if (existingId.equals(resolvedDst)) {
+            throw new FileAlreadyExistsException(
+                UriUtil.getStringPath(resolvedDst),
+                null,
+                "Cannot rename because destination already exists");
+          }
+          throw GcsExceptionUtil.createFileAlreadyExistsException(
+              resolvedDst, existingId, "Cannot rename because destination already exists");
+        }
+        awaitNonDir = true;
+      } finally {
+        if (!awaitNonDir) {
+          nonDirFuture.cancel(true);
+        }
+      }
+      try {
+        Optional<GcsItemInfo> nonDirInfo = getFromFuture(nonDirFuture);
+        if (nonDirInfo.isPresent()) {
+          GcsItemId existingId = UriUtil.withoutContentGeneration(nonDirInfo.get().getItemId());
+          throw GcsExceptionUtil.createFileAlreadyExistsException(
+              resolvedDst, existingId, "Cannot rename because destination already exists");
+        }
+      } catch (AccessDeniedException e) {
+        // The stripped non-directory probe is best-effort under prefix-scoped Credential Access
+        // Boundaries, where objects/<dir>/ is allowed but objects/<dir> is outside the rule.
+        LOG.warn(
+            "Skipping conflicting-file check for resolved destination in bucket {} because the"
+                + " caller cannot read the non-directory path",
+            resolvedDst.getBucketName());
+        LOG.debug(
+            "Conflicting-file check access denied for resolved destination '{}'",
+            UriUtil.getStringPath(nonDirId),
+            e);
+      }
+      return;
+    }
+
+    try {
+      GcsFileInfo existingInfo = getFileInfo(resolvedDst);
+      GcsItemId existingId =
+          UriUtil.withoutContentGeneration(existingInfo.getItemInfo().getItemId());
+      if (existingId.equals(resolvedDst)) {
+        throw new FileAlreadyExistsException(
+            UriUtil.getStringPath(resolvedDst),
+            null,
+            "Cannot rename because destination already exists");
+      }
+      throw GcsExceptionUtil.createFileAlreadyExistsException(
+          resolvedDst, existingId, "Cannot rename because destination already exists");
+    } catch (FileNotFoundException ignored) {
+      // Resolved destination does not exist; safe to proceed.
+    }
+  }
+
+  private void repairImplicitParentDirectory(
+      GcsItemId parentId, Future<Optional<GcsItemInfo>> parentProbeFuture) {
+    Optional<GcsItemInfo> parentInfo;
+    try {
+      parentInfo = getFromFuture(parentProbeFuture);
+    } catch (InterruptedIOException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn(
+          "Failed to check implicit parent directory in bucket {} after rename; continuing",
+          parentId.getBucketName());
+      LOG.debug("Implicit parent directory check failed for '{}'", parentId, e);
+      return;
+    } catch (IOException | RuntimeException e) {
+      LOG.warn(
+          "Failed to check implicit parent directory in bucket {} after rename; continuing",
+          parentId.getBucketName());
+      LOG.debug("Implicit parent directory check failed for '{}'", parentId, e);
+      return;
+    }
+
+    if (parentInfo.isPresent()) {
+      return;
+    }
+
+    try {
+      gcsClient.createEmptyObject(parentId);
+    } catch (InterruptedIOException e) {
+      Thread.currentThread().interrupt();
+      LOG.warn(
+          "Failed to repair implicit parent directory in bucket {} after rename; continuing",
+          parentId.getBucketName());
+      LOG.debug("Implicit parent directory repair failed for '{}'", parentId, e);
+    } catch (IOException | RuntimeException e) {
+      LOG.warn(
+          "Failed to repair implicit parent directory in bucket {} after rename; continuing",
+          parentId.getBucketName());
+      LOG.debug("Implicit parent directory repair failed for '{}'", parentId, e);
+    }
+  }
+
+  /**
+   * Moves {@code srcItemInfo} to {@code dstId} with {@code dstGen=0L} (enabling GCS SDK retries and
+   * overwrite protection) and recovers from lost-response retries when destination checksum
+   * verification proves the earlier attempt already moved the object.
+   */
+  static void moveObjectWithRetryRecovery(
+      GcsClient gcsClient, GcsItemInfo srcItemInfo, GcsItemId dstId) throws IOException {
+    checkNotNull(gcsClient, "gcsClient should not be null");
+    checkNotNull(srcItemInfo, "srcItemInfo should not be null");
+    checkNotNull(dstId, "dstId should not be null");
+
+    GcsItemId srcIdWithoutGen = UriUtil.withoutContentGeneration(srcItemInfo.getItemId());
+    Optional<Long> srcGeneration =
+        srcItemInfo
+            .getContentGeneration()
+            .or(() -> srcItemInfo.getItemId().getContentGeneration())
+            .filter(gen -> gen > 0L);
+    GcsItemId.Builder srcIdBuilder =
+        GcsItemId.builder()
+            .setBucketName(srcIdWithoutGen.getBucketName())
+            .setObjectName(srcIdWithoutGen.getObjectName().get());
+    srcGeneration.ifPresent(srcIdBuilder::setContentGeneration);
+    GcsItemId srcIdWithGen = srcIdBuilder.build();
+
+    GcsItemId dstIdWithoutGen = UriUtil.withoutContentGeneration(dstId);
+    GcsItemId dstIdWithGen0 =
+        GcsItemId.builder()
+            .setBucketName(dstIdWithoutGen.getBucketName())
+            .setObjectName(dstIdWithoutGen.getObjectName().get())
+            .setContentGeneration(0L)
+            .build();
+
+    try {
+      gcsClient.moveObject(srcIdWithGen, dstIdWithGen0);
+    } catch (FileNotFoundException e) {
+      if (!hasChecksum(srcItemInfo)) {
+        throw e;
+      }
+      GcsItemInfo dstInfo;
+      try {
+        dstInfo = gcsClient.getGcsItemInfo(dstIdWithoutGen);
+      } catch (IOException probeFailure) {
+        e.addSuppressed(probeFailure);
+        throw e;
+      }
+      if (checksumsMatch(srcItemInfo, dstInfo)) {
+        LOG.debug(
+            "Recovered from 404 on retried move {} -> {}: destination matches source checksum.",
+            srcIdWithoutGen,
+            dstIdWithoutGen);
+        return;
+      }
+      throw e;
+    } catch (IOException e) {
+      if (!isPreconditionFailed(e) || !hasChecksum(srcItemInfo)) {
+        throw e;
+      }
+      GcsItemInfo dstInfo;
+      try {
+        dstInfo = gcsClient.getGcsItemInfo(dstIdWithoutGen);
+      } catch (IOException probeFailure) {
+        e.addSuppressed(probeFailure);
+        throw e;
+      }
+      if (!checksumsMatch(srcItemInfo, dstInfo)) {
+        throw e;
+      }
+      try {
+        GcsItemInfo liveSrcInfo = gcsClient.getGcsItemInfo(srcIdWithoutGen);
+        Optional<Long> liveSrcGen =
+            liveSrcInfo
+                .getContentGeneration()
+                .or(() -> liveSrcInfo.getItemId().getContentGeneration())
+                .filter(gen -> gen > 0L);
+        if (srcGeneration.isPresent()
+            && liveSrcGen.isPresent()
+            && !srcGeneration.get().equals(liveSrcGen.get())) {
+          LOG.debug(
+              "Recovered from 412 on retried move {} -> {}: destination matches source checksum"
+                  + " and source generation changed ({} -> {}).",
+              srcIdWithoutGen,
+              dstIdWithoutGen,
+              srcGeneration.get(),
+              liveSrcGen.get());
+          return;
+        }
+      } catch (FileNotFoundException ignored) {
+        LOG.debug(
+            "Recovered from 412 on retried move {} -> {}: destination matches source checksum and"
+                + " source no longer exists.",
+            srcIdWithoutGen,
+            dstIdWithoutGen);
+        return;
+      } catch (IOException probeFailure) {
+        e.addSuppressed(probeFailure);
+        throw e;
+      }
+      throw e;
+    }
+  }
+
+  private Optional<GcsItemInfo> lookupObjectInfoOptional(GcsItemId itemId) throws IOException {
+    try {
+      return Optional.of(gcsClient.getGcsItemInfo(itemId));
+    } catch (FileNotFoundException ignored) {
+      return Optional.empty();
+    }
+  }
+
+  private Optional<GcsItemInfo> lookupDirectoryInfoOptional(
+      NamespaceStrategy strategy, GcsItemId itemId, boolean inferImplicitDirectories)
+      throws IOException {
+    try {
+      return Optional.of(strategy.getDirectoryInfo(itemId, inferImplicitDirectories));
+    } catch (FileNotFoundException ignored) {
+      return Optional.empty();
+    }
+  }
+
+  private static boolean isDirectory(GcsItemInfo itemInfo) {
+    switch (itemInfo.getItemType()) {
+      case INFERRED_DIRECTORY:
+      case PLACEHOLDER_DIRECTORY:
+      case NATIVE_FOLDER:
+      case BUCKET:
+      case ROOT:
+        return true;
+      case OBJECT:
+        return false;
+    }
+    throw new AssertionError("Unexpected item type: " + itemInfo.getItemType());
+  }
+
+  private static boolean isPreconditionFailed(IOException e) {
+    return GcsExceptionUtil.getStorageException(e)
+        .map(
+            se ->
+                GcsExceptionUtil.getErrorType(se) == GcsExceptionUtil.ErrorType.PRECONDITION_FAILED)
+        .orElse(false);
+  }
+
+  private static boolean hasChecksum(GcsItemInfo itemInfo) {
+    return itemInfo
+        .getVerificationAttributes()
+        .map(attrs -> isNonEmpty(attrs.getCrc32c()) || isNonEmpty(attrs.getMd5hash()))
+        .orElse(false);
+  }
+
+  private static boolean checksumsMatch(GcsItemInfo srcInfo, GcsItemInfo dstInfo) {
+    if (srcInfo.getVerificationAttributes().isEmpty()
+        || dstInfo.getVerificationAttributes().isEmpty()) {
+      return false;
+    }
+    VerificationAttributes src = srcInfo.getVerificationAttributes().get();
+    VerificationAttributes dst = dstInfo.getVerificationAttributes().get();
+    boolean srcHasCrc = isNonEmpty(src.getCrc32c());
+    boolean dstHasCrc = isNonEmpty(dst.getCrc32c());
+    boolean srcHasMd5 = isNonEmpty(src.getMd5hash());
+    boolean dstHasMd5 = isNonEmpty(dst.getMd5hash());
+    if (srcHasCrc != dstHasCrc || srcHasMd5 != dstHasMd5) {
+      return false;
+    }
+    if (!srcHasCrc && !srcHasMd5) {
+      return false;
+    }
+    if (srcHasCrc && !Arrays.equals(src.getCrc32c(), dst.getCrc32c())) {
+      return false;
+    }
+    if (srcHasMd5 && !Arrays.equals(src.getMd5hash(), dst.getMd5hash())) {
+      return false;
+    }
+    return true;
+  }
+
+  private static boolean isNonEmpty(@Nullable byte[] bytes) {
+    return bytes != null && bytes.length > 0;
+  }
+
+  private static void cancelIfPresent(@Nullable Future<?> future) {
+    if (future != null) {
+      future.cancel(true);
+    }
+  }
+
+  private static final class RenameMetadata {
+    private final GcsFileInfo srcInfo;
+    private final GcsItemId dstId;
+    private final boolean dstExists;
+    private final boolean dstIsDir;
+    private final Optional<GcsItemId> dstConflictingFileId;
+    private final Optional<GcsItemId> dstParentOpt;
+    private final boolean dstParentExists;
+
+    private RenameMetadata(
+        GcsFileInfo srcInfo,
+        GcsItemId dstId,
+        boolean dstExists,
+        boolean dstIsDir,
+        Optional<GcsItemId> dstConflictingFileId,
+        Optional<GcsItemId> dstParentOpt,
+        boolean dstParentExists) {
+      this.srcInfo = srcInfo;
+      this.dstId = dstId;
+      this.dstExists = dstExists;
+      this.dstIsDir = dstIsDir;
+      this.dstConflictingFileId = dstConflictingFileId;
+      this.dstParentOpt = dstParentOpt;
+      this.dstParentExists = dstParentExists;
+    }
   }
 
   @VisibleForTesting

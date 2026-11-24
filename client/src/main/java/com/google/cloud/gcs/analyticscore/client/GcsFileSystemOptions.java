@@ -16,11 +16,15 @@
 package com.google.cloud.gcs.analyticscore.client;
 
 import com.google.auto.value.AutoValue;
+import com.google.auto.value.extension.memoized.Memoized;
 import com.google.cloud.gcs.analyticscore.client.auth.GcsAuthOptions;
 import com.google.cloud.gcs.analyticscore.common.ConfigurationUtil;
 import com.google.cloud.gcs.analyticscore.common.telemetry.TelemetryOptions;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+import javax.annotation.Nullable;
 
 /** Configuration options for the GCS File System. */
 @AutoValue
@@ -33,6 +37,10 @@ public abstract class GcsFileSystemOptions {
       "analytics-core.metadata.lookup.parallel.enable";
   private static final String CREATE_ITEMS_CONFLICT_CHECK_ENABLE_KEY =
       "analytics-core.create.items.conflict.check.enable";
+  private static final String AUTO_REPAIR_IMPLICIT_DIRECTORIES_ENABLED_KEY =
+      "analytics-core.directory.implicit-repair.enable";
+  private static final String MARKER_FILE_PATTERN_KEY =
+      "analytics-core.directory.marker-file-pattern";
 
   /**
    * Cloud Storage client to use.
@@ -77,6 +85,35 @@ public abstract class GcsFileSystemOptions {
    */
   public abstract boolean isCreateItemsConflictCheckEnabled();
 
+  /**
+   * Returns whether implicit parent directories are automatically repaired by creating an explicit
+   * 0-byte marker object after mutating operations (such as {@link GcsFileSystem#rename}) on
+   * flat-namespace buckets.
+   *
+   * <p>Defaults to {@code true}. Ignored on hierarchical namespace (HNS) buckets.
+   */
+  public abstract boolean isAutoRepairImplicitDirectoriesEnabled();
+
+  @Nullable
+  abstract String getRawMarkerFilePattern();
+
+  /**
+   * Returns the compiled pattern identifying marker files (for example {@code _SUCCESS}) that must
+   * be moved last, after all non-marker objects, during flat-namespace directory renames.
+   *
+   * <p>When configured, the trimmed regex is compiled as {@code ^(.+/)?(?:<pattern>)$} and matched
+   * against the full relative path of each object under the renamed source directory.
+   *
+   * <p>Defaults to {@link Optional#empty()}. Ignored on hierarchical namespace (HNS) buckets.
+   */
+  @Memoized
+  public Optional<Pattern> getMarkerFilePattern() {
+    String rawPattern = getRawMarkerFilePattern();
+    return rawPattern == null
+        ? Optional.empty()
+        : Optional.of(Pattern.compile("^(.+/)?(?:" + rawPattern + ")$"));
+  }
+
   public abstract Builder toBuilder();
 
   @SuppressWarnings("deprecation")
@@ -87,6 +124,8 @@ public abstract class GcsFileSystemOptions {
         .setHnsApiEnabled(true)
         .setMetadataLookupParallelEnabled(true)
         .setCreateItemsConflictCheckEnabled(true)
+        .setAutoRepairImplicitDirectoriesEnabled(true)
+        .setRawMarkerFilePattern(null)
         .setGcsAuthOptions(GcsAuthOptions.builder().build())
         .setGcsClientOptions(GcsClientOptions.builder().build())
         .setGcsCacheOptions(GcsCacheOptions.builder().build())
@@ -128,6 +167,16 @@ public abstract class GcsFileSystemOptions {
       optionsBuilder.setCreateItemsConflictCheckEnabled(
           Boolean.parseBoolean(createItemsConflictCheckEnabled.get()));
     }
+    Optional<String> autoRepairImplicitDirectoriesEnabled =
+        ConfigurationUtil.getTrimmedValue(
+            analyticsCoreOptions, prefix + AUTO_REPAIR_IMPLICIT_DIRECTORIES_ENABLED_KEY);
+    if (autoRepairImplicitDirectoriesEnabled.isPresent()) {
+      optionsBuilder.setAutoRepairImplicitDirectoriesEnabled(
+          Boolean.parseBoolean(autoRepairImplicitDirectoriesEnabled.get()));
+    }
+    Optional<String> markerFilePattern =
+        ConfigurationUtil.getTrimmedValue(analyticsCoreOptions, prefix + MARKER_FILE_PATTERN_KEY);
+    markerFilePattern.ifPresent(optionsBuilder::setMarkerFilePattern);
 
     optionsBuilder.setGcsAuthOptions(
         GcsAuthOptions.createFromOptions(analyticsCoreOptions, prefix));
@@ -139,7 +188,17 @@ public abstract class GcsFileSystemOptions {
     optionsBuilder.setAnalyticsCoreTelemetryOptions(
         TelemetryOptions.createFromOptions(analyticsCoreOptions, prefix + "analytics-core."));
 
-    return optionsBuilder.build();
+    try {
+      return optionsBuilder.build();
+    } catch (PatternSyntaxException e) {
+      throw new IllegalArgumentException(
+          "Invalid regular expression for "
+              + prefix
+              + MARKER_FILE_PATTERN_KEY
+              + ": "
+              + markerFilePattern.orElse(""),
+          e);
+    }
   }
 
   /** Builder for {@link GcsFileSystemOptions}. */
@@ -160,6 +219,32 @@ public abstract class GcsFileSystemOptions {
     public abstract Builder setCreateItemsConflictCheckEnabled(
         boolean isCreateItemsConflictCheckEnabled);
 
+    public abstract Builder setAutoRepairImplicitDirectoriesEnabled(
+        boolean isAutoRepairImplicitDirectoriesEnabled);
+
+    abstract Builder setRawMarkerFilePattern(@Nullable String rawMarkerFilePattern);
+
+    /**
+     * Sets the regular expression identifying marker files (for example {@code _SUCCESS}) that must
+     * be moved last during flat-namespace directory renames, or clears it when {@code
+     * markerFilePattern} is {@code null} or blank.
+     *
+     * <p>The trimmed regex is compiled as {@code ^(.+/)?(?:<pattern>)$} in {@link #build()} and
+     * matched against the full relative path of each object under the renamed source directory.
+     */
+    public Builder setMarkerFilePattern(@Nullable String markerFilePattern) {
+      if (markerFilePattern == null) {
+        return setRawMarkerFilePattern(null);
+      }
+      String trimmed = markerFilePattern.trim();
+      return setRawMarkerFilePattern(trimmed.isEmpty() ? null : trimmed);
+    }
+
+    /** Clears any configured marker file pattern. */
+    public Builder clearMarkerFilePattern() {
+      return setRawMarkerFilePattern(null);
+    }
+
     public abstract Builder setMetadataLookupParallelEnabled(
         boolean isMetadataLookupParallelEnabled);
 
@@ -172,6 +257,20 @@ public abstract class GcsFileSystemOptions {
 
     public abstract Builder setAnalyticsCoreTelemetryOptions(TelemetryOptions telemetryOptions);
 
-    public abstract GcsFileSystemOptions build();
+    abstract GcsFileSystemOptions autoBuild();
+
+    /**
+     * Builds the {@link GcsFileSystemOptions} instance.
+     *
+     * @throws PatternSyntaxException if a configured marker file pattern is not a valid regular
+     *     expression
+     */
+    public GcsFileSystemOptions build() {
+      GcsFileSystemOptions options = autoBuild();
+      // Eagerly compile and cache the marker file pattern so invalid regexes fail fast at build
+      // time.
+      options.getMarkerFilePattern();
+      return options;
+    }
   }
 }

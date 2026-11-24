@@ -33,8 +33,11 @@ import org.junit.jupiter.api.Test;
 class GcsFileSystemTest {
 
   private static final URI DIR_URI = URI.create("gs://test-bucket/dir/");
+  private static final URI DST_URI = URI.create("gs://test-bucket/dst/");
   private static final GcsItemId DIR_ITEM_ID =
       GcsItemId.builder().setBucketName("test-bucket").setObjectName("dir/").build();
+  private static final GcsItemId DST_ITEM_ID =
+      GcsItemId.builder().setBucketName("test-bucket").setObjectName("dst/").build();
 
   @Test
   void mkdirs_itemIdNotOverridden_throwsUnsupportedOperationException() {
@@ -102,5 +105,54 @@ class GcsFileSystemTest {
     GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
 
     assertThrows(NullPointerException.class, () -> fileSystem.listFileInfo((URI) null));
+  }
+
+  @Test
+  void rename_itemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    UnsupportedOperationException e =
+        assertThrows(
+            UnsupportedOperationException.class, () -> fileSystem.rename(DIR_ITEM_ID, DST_ITEM_ID));
+    assertThat(e).hasMessageThat().startsWith("rename is not supported by ");
+  }
+
+  @Test
+  void rename_uri_delegatesToItemIdOverload() throws IOException {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+    doNothing().when(fileSystem).rename(DIR_ITEM_ID, DST_ITEM_ID);
+
+    fileSystem.rename(DIR_URI, DST_URI);
+
+    verify(fileSystem).rename(DIR_ITEM_ID, DST_ITEM_ID);
+  }
+
+  @Test
+  void rename_percentEncodedUri_decodesAndDelegatesToItemIdOverload() throws IOException {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+    GcsItemId expectedSrc =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("a b?c#d%e.txt").build();
+    GcsItemId expectedDst =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("x y%20z.txt").build();
+    doNothing().when(fileSystem).rename(expectedSrc, expectedDst);
+
+    fileSystem.rename(expectedSrc.toUri(), expectedDst.toUri());
+
+    verify(fileSystem).rename(expectedSrc, expectedDst);
+  }
+
+  @Test
+  void rename_uriWithItemIdNotOverridden_throwsUnsupportedOperationException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    assertThrows(UnsupportedOperationException.class, () -> fileSystem.rename(DIR_URI, DST_URI));
+  }
+
+  @Test
+  void rename_nullUri_throwsNullPointerException() {
+    GcsFileSystem fileSystem = mock(GcsFileSystem.class, CALLS_REAL_METHODS);
+
+    assertThrows(NullPointerException.class, () -> fileSystem.rename((URI) null, DST_URI));
+    assertThrows(NullPointerException.class, () -> fileSystem.rename(DIR_URI, (URI) null));
   }
 }

@@ -22,6 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import com.google.common.collect.ImmutableMap;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -85,6 +87,8 @@ class GcsFileSystemOptionsTest {
     assertThat(options.getReadThreadCount()).isEqualTo(16);
     assertThat(options.isHnsApiEnabled()).isTrue();
     assertThat(options.isCreateItemsConflictCheckEnabled()).isTrue();
+    assertThat(options.isAutoRepairImplicitDirectoriesEnabled()).isTrue();
+    assertThat(options.getMarkerFilePattern()).isEmpty();
 
     GcsCacheOptions cacheOptions = options.getGcsCacheOptions();
     assertThat(cacheOptions.isFooterCacheEnabled()).isFalse();
@@ -233,5 +237,146 @@ class GcsFileSystemOptionsTest {
 
     // Assert
     assertThat(options.getClientType()).isEqualTo(GcsFileSystemOptions.ClientType.HTTP_CLIENT);
+  }
+
+  @Test
+  void createFromOptions_directoryRenameOptions_parsesValues() {
+    ImmutableMap<String, String> properties =
+        ImmutableMap.of(
+            "fs.gs.analytics-core.directory.implicit-repair.enable", " false ",
+            "fs.gs.analytics-core.directory.marker-file-pattern", " _SUCCESS ");
+
+    GcsFileSystemOptions options = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+
+    assertThat(options.isAutoRepairImplicitDirectoriesEnabled()).isFalse();
+    assertThat(options.getMarkerFilePattern()).isPresent();
+    Pattern pattern = options.getMarkerFilePattern().get();
+    assertThat(pattern.pattern()).isEqualTo("^(.+/)?(?:_SUCCESS)$");
+    assertThat(pattern.matcher("_SUCCESS").matches()).isTrue();
+    assertThat(pattern.matcher("sub/dir/_SUCCESS").matches()).isTrue();
+    assertThat(pattern.matcher("_SUCCESS_extra").matches()).isFalse();
+    assertThat(pattern.matcher("part-00000.parquet").matches()).isFalse();
+  }
+
+  @Test
+  void createFromOptions_blankAndNullDirectoryRenameOptions_retainsDefaults() {
+    Map<String, String> properties = new HashMap<>();
+    properties.put("fs.gs.analytics-core.directory.implicit-repair.enable", "   ");
+    properties.put("fs.gs.analytics-core.directory.marker-file-pattern", "   ");
+
+    GcsFileSystemOptions blankOptions =
+        GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+
+    assertThat(blankOptions.isAutoRepairImplicitDirectoriesEnabled()).isTrue();
+    assertThat(blankOptions.getMarkerFilePattern()).isEmpty();
+
+    properties.put("fs.gs.analytics-core.directory.implicit-repair.enable", null);
+    properties.put("fs.gs.analytics-core.directory.marker-file-pattern", null);
+    GcsFileSystemOptions nullOptions = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+
+    assertThat(nullOptions.isAutoRepairImplicitDirectoriesEnabled()).isTrue();
+    assertThat(nullOptions.getMarkerFilePattern()).isEmpty();
+  }
+
+  @Test
+  void createFromOptions_invalidMarkerFilePattern_throwsIllegalArgumentExceptionNamingConfigKey() {
+    ImmutableMap<String, String> properties =
+        ImmutableMap.of("fs.gs.analytics-core.directory.marker-file-pattern", "[unclosed");
+
+    IllegalArgumentException exception =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> GcsFileSystemOptions.createFromOptions(properties, "fs.gs."));
+
+    assertThat(exception)
+        .hasMessageThat()
+        .contains("fs.gs.analytics-core.directory.marker-file-pattern");
+    assertThat(exception).hasCauseThat().isInstanceOf(PatternSyntaxException.class);
+  }
+
+  @Test
+  void builder_setMarkerFilePattern_regexString_compilesAnchoredPattern() {
+    GcsFileSystemOptions options =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("_SUCCESS|\\.done").build();
+
+    assertThat(options.getMarkerFilePattern()).isPresent();
+    Pattern pattern = options.getMarkerFilePattern().get();
+    assertThat(pattern.pattern()).isEqualTo("^(.+/)?(?:_SUCCESS|\\.done)$");
+    assertThat(pattern.matcher("a/b/_SUCCESS").matches()).isTrue();
+    assertThat(pattern.matcher(".done").matches()).isTrue();
+    assertThat(pattern.matcher("a/b/.done").matches()).isTrue();
+    assertThat(pattern.matcher("a/b/file.done").matches()).isFalse();
+    assertThat(pattern.matcher("_SUCCESS.bak").matches()).isFalse();
+  }
+
+  @Test
+  void builder_setMarkerFilePattern_nullString_clearsPattern() {
+    GcsFileSystemOptions initial =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("_SUCCESS").build();
+
+    GcsFileSystemOptions cleared = initial.toBuilder().setMarkerFilePattern(null).build();
+
+    assertThat(cleared.getMarkerFilePattern()).isEmpty();
+  }
+
+  @Test
+  void builder_setMarkerFilePattern_blankString_clearsPattern() {
+    GcsFileSystemOptions initial =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("_SUCCESS").build();
+
+    GcsFileSystemOptions cleared = initial.toBuilder().setMarkerFilePattern("   ").build();
+
+    assertThat(cleared.getMarkerFilePattern()).isEmpty();
+  }
+
+  @Test
+  void builder_clearMarkerFilePattern_clearsPattern() {
+    GcsFileSystemOptions initial =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("_SUCCESS").build();
+
+    GcsFileSystemOptions cleared = initial.toBuilder().clearMarkerFilePattern().build();
+
+    assertThat(cleared.getMarkerFilePattern()).isEmpty();
+  }
+
+  @Test
+  void builder_setMarkerFilePattern_invalidRegex_throwsPatternSyntaxExceptionOnBuild() {
+    GcsFileSystemOptions.Builder builder =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("[unclosed");
+
+    assertThrows(PatternSyntaxException.class, builder::build);
+  }
+
+  @Test
+  void equalsAndHashCode_sameMarkerFilePattern_areEqualByValue() {
+    ImmutableMap<String, String> properties =
+        ImmutableMap.of("fs.gs.analytics-core.directory.marker-file-pattern", "_SUCCESS");
+
+    GcsFileSystemOptions fromMap1 = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+    GcsFileSystemOptions fromMap2 = GcsFileSystemOptions.createFromOptions(properties, "fs.gs.");
+    GcsFileSystemOptions fromBuilderPadded =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("  _SUCCESS  ").build();
+    GcsFileSystemOptions different =
+        GcsFileSystemOptions.builder().setMarkerFilePattern("_DONE").build();
+
+    assertThat(fromMap1).isEqualTo(fromMap2);
+    assertThat(fromMap1.hashCode()).isEqualTo(fromMap2.hashCode());
+    assertThat(fromMap1).isEqualTo(fromBuilderPadded);
+    assertThat(fromMap1.hashCode()).isEqualTo(fromBuilderPadded.hashCode());
+    assertThat(fromMap1).isNotEqualTo(different);
+    assertThat(fromMap1.getMarkerFilePattern().orElseThrow())
+        .isSameInstanceAs(fromMap1.getMarkerFilePattern().orElseThrow());
+  }
+
+  @Test
+  void signatures_doNotExposeGuavaTypes() {
+    GcsFileSystemOptions built = GcsFileSystemOptions.builder().build();
+    ApiSignatureTestUtils.assertNoGuavaTypesInSignatures(
+        GcsFileSystem.class,
+        GcsFileSystemOptions.class,
+        GcsFileSystemOptions.Builder.class,
+        built.getClass(),
+        built.getClass().getSuperclass(),
+        GcsFileSystemOptions.builder().getClass());
   }
 }

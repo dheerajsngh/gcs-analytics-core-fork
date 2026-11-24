@@ -24,6 +24,7 @@ import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCache;
 import com.google.cloud.gcs.analyticscore.common.telemetry.Telemetry;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageException;
 import com.google.cloud.storage.contrib.nio.testing.LocalStorageHelper;
@@ -87,6 +88,45 @@ public class FakeGcsClientImpl extends GcsClientImpl {
   public BucketProperties getBucketProperties(String bucketName) {
     // LocalStorageHelper does not support bucket operations
     return BucketProperties.create(false, false);
+  }
+
+  /**
+   * Creates an empty object without passing {@code BlobTargetOption}s that {@link
+   * LocalStorageHelper} rejects with {@link UnsupportedOperationException}, while enforcing
+   * overwrite protection matching {@link GcsClientImpl#createEmptyObject}.
+   */
+  @Override
+  public void createEmptyObject(GcsItemId itemId, GcsWriteOptions options) throws IOException {
+    checkNotNull(itemId, "itemId must not be null");
+    checkArgument(itemId.isGcsObject(), "Expected a GCS object itemId but got: %s", itemId);
+    checkNotNull(options, "options must not be null");
+    BlobId blobId = BlobId.of(itemId.getBucketName(), itemId.getObjectName().get());
+    Blob existing = storage.get(blobId);
+    boolean shouldNotOverwrite =
+        !options.isOverwriteExisting()
+            || (itemId.isDirectory() && itemId.getContentGeneration().isEmpty());
+    if (existing != null && shouldNotOverwrite) {
+      if (itemId.isDirectory() && (existing.getSize() == null || existing.getSize() == 0L)) {
+        return;
+      }
+      throw GcsExceptionUtil.createFileAlreadyExistsException(
+          itemId, new StorageException(412, "Precondition Failed"));
+    }
+    if (!shouldNotOverwrite
+        && itemId
+            .getContentGeneration()
+            .filter(
+                gen ->
+                    gen == 0L
+                        ? existing != null
+                        : existing == null || !gen.equals(existing.getGeneration()))
+            .isPresent()) {
+      throw GcsExceptionUtil.translateStorageException(
+          new StorageException(412, "Precondition Failed"),
+          itemId,
+          "Failed to create empty object: " + itemId);
+    }
+    storage.create(BlobInfo.newBuilder(blobId).build(), new byte[0]);
   }
 
   /**

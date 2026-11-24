@@ -19,8 +19,11 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Optional;
+import javax.annotation.Nullable;
 
 /**
  * Utility class for parsing and formatting GCS URIs.
@@ -220,5 +223,160 @@ final class UriUtil {
 
   static String toDirectoryPath(String path) {
     return isNullOrEmpty(path) || path.endsWith(PATH_DELIMITER) ? path : path + PATH_DELIMITER;
+  }
+
+  /** Returns {@code itemId} with any {@link GcsItemId#getContentGeneration()} stripped. */
+  static GcsItemId withoutContentGeneration(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.getContentGeneration().isEmpty()) {
+      return itemId;
+    }
+    GcsItemId.Builder builder = GcsItemId.builder().setBucketName(itemId.getBucketName());
+    itemId.getObjectName().ifPresent(builder::setObjectName);
+    return builder.build();
+  }
+
+  /**
+   * Returns the parent identifier of {@code itemId} without content generation, or {@link
+   * Optional#empty()} for {@link GcsItemId#ROOT}.
+   *
+   * <ul>
+   *   <li>Root -> {@link Optional#empty()}
+   *   <li>Bucket -> {@link GcsItemId#ROOT}
+   *   <li>Top-level object or directory -> bucket ID
+   *   <li>Nested object or directory -> parent directory ID ending with {@code "/"}
+   * </ul>
+   */
+  static Optional<GcsItemId> getParentId(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.isRoot()) {
+      return Optional.empty();
+    }
+    if (itemId.isBucket()) {
+      return Optional.of(GcsItemId.ROOT);
+    }
+    checkArgument(
+        itemId.isGcsObject(), "Expected root, bucket, or GCS object itemId, but got: %s", itemId);
+    String trimmed = removeTrailingSlash(itemId.getObjectName().orElseThrow());
+    int lastSlash = trimmed.lastIndexOf('/');
+    if (lastSlash <= 0) {
+      return Optional.of(GcsItemId.builder().setBucketName(itemId.getBucketName()).build());
+    }
+    String parentObjectName = trimmed.substring(0, lastSlash + 1);
+    return Optional.of(
+        GcsItemId.builder()
+            .setBucketName(itemId.getBucketName())
+            .setObjectName(parentObjectName)
+            .build());
+  }
+
+  /**
+   * Returns {@code true} if any {@code "/"}-delimited segment of {@code path} equals {@code "."} or
+   * {@code ".."}.
+   */
+  static boolean hasDotSegment(@Nullable String path) {
+    if (isNullOrEmpty(path)) {
+      return false;
+    }
+    int start = 0;
+    int length = path.length();
+    while (start < length) {
+      int end = path.indexOf('/', start);
+      if (end < 0) {
+        end = length;
+      }
+      int segmentLength = end - start;
+      if ((segmentLength == 1 && path.charAt(start) == '.')
+          || (segmentLength == 2 && path.charAt(start) == '.' && path.charAt(start + 1) == '.')) {
+        return true;
+      }
+      start = end + 1;
+    }
+    return false;
+  }
+
+  /**
+   * Returns the leaf name of {@code itemId} without a trailing {@code "/"}: empty for root, the
+   * bucket name for a bucket, or the final path segment for an object or directory.
+   */
+  static Optional<String> getLeafName(GcsItemId itemId) {
+    checkNotNull(itemId, "itemId should not be null");
+    if (itemId.isRoot()) {
+      return Optional.empty();
+    }
+    if (itemId.isBucket()) {
+      return Optional.of(itemId.getBucketName());
+    }
+    checkArgument(
+        itemId.isGcsObject(), "Expected root, bucket, or GCS object itemId, but got: %s", itemId);
+    String trimmed = removeTrailingSlash(itemId.getObjectName().get());
+    if (trimmed.isEmpty()) {
+      return Optional.empty();
+    }
+    int lastSlash = trimmed.lastIndexOf('/');
+    String leaf = lastSlash < 0 ? trimmed : trimmed.substring(lastSlash + 1);
+    return leaf.isEmpty() ? Optional.empty() : Optional.of(leaf);
+  }
+
+  /**
+   * Returns {@code true} if {@code dst} is in the same bucket and strictly inside {@code srcDir}.
+   */
+  static boolean isSubdirectory(GcsItemId srcDir, GcsItemId dst) {
+    checkNotNull(srcDir, "srcDir should not be null");
+    checkNotNull(dst, "dst should not be null");
+    if (srcDir.isRoot() || dst.isRoot()) {
+      return false;
+    }
+    if (!srcDir.getBucketName().equals(dst.getBucketName())) {
+      return false;
+    }
+    if (srcDir.isBucket()) {
+      return !dst.isBucket();
+    }
+    if (dst.isBucket()) {
+      return false;
+    }
+    String srcPrefix = toDirectoryPath(srcDir.getObjectName().orElse(""));
+    String dstPrefix = toDirectoryPath(dst.getObjectName().orElse(""));
+    return !srcPrefix.equals(dstPrefix) && dstPrefix.startsWith(srcPrefix);
+  }
+
+  /**
+   * Rejects empty, leading-{@code "/"}, consecutive-{@code "//"}, or {@code "."}/{@code ".."}
+   * relative child paths when resolving a child under {@code dstDirId}.
+   */
+  static void validateRelativeChildPath(
+      @Nullable String relativePath, GcsItemId srcId, GcsItemId dstDirId) throws IOException {
+    if (isNullOrEmpty(relativePath)
+        || relativePath.startsWith(PATH_DELIMITER)
+        || relativePath.contains(PATH_DELIMITER + PATH_DELIMITER)
+        || hasDotSegment(relativePath)) {
+      throw new IOException(
+          String.format(
+              "Refusing to rename '%s': invalid relative path '%s' for destination '%s'",
+              getStringPath(srcId), relativePath, getStringPath(dstDirId)));
+    }
+  }
+
+  /**
+   * Resolves a validated relative child path under {@code dstDirId}, appending a trailing {@code
+   * "/"} when {@code isDirectory} is {@code true}.
+   */
+  static GcsItemId resolveChildId(
+      GcsItemId dstDirId, String relativePath, GcsItemId srcId, boolean isDirectory)
+      throws IOException {
+    checkNotNull(dstDirId, "dstDirId should not be null");
+    checkArgument(!dstDirId.isRoot(), "Destination directory must not be root: %s", dstDirId);
+    validateRelativeChildPath(relativePath, srcId, dstDirId);
+    String dstPrefix =
+        dstDirId.isBucket() ? "" : toDirectoryPath(dstDirId.getObjectName().orElse(""));
+    String targetObjectName = dstPrefix + relativePath;
+    if (isDirectory) {
+      targetObjectName = toDirectoryPath(targetObjectName);
+    }
+    return GcsItemId.builder()
+        .setBucketName(dstDirId.getBucketName())
+        .setObjectName(targetObjectName)
+        .build();
   }
 }

@@ -19,6 +19,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -486,5 +487,154 @@ class UriUtilTest {
   @Test
   void validateDirectoryItemId_nullItemId_throwsNullPointerException() {
     assertThrows(NullPointerException.class, () -> UriUtil.validateDirectoryItemId(null));
+  }
+
+  @Test
+  void withoutContentGeneration_stripsGenerationAndPreservesOtherFields() {
+    GcsItemId withGen =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName(TEST_OBJECT)
+            .setContentGeneration(42L)
+            .build();
+    GcsItemId withoutGen =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(TEST_OBJECT).build();
+
+    assertThat(UriUtil.withoutContentGeneration(withGen)).isEqualTo(withoutGen);
+    assertThat(UriUtil.withoutContentGeneration(withoutGen)).isSameInstanceAs(withoutGen);
+    assertThrows(NullPointerException.class, () -> UriUtil.withoutContentGeneration(null));
+  }
+
+  @Test
+  void getParentId_variousItemTypes_returnsExpectedParentWithoutGeneration() {
+    GcsItemId bucket = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId topFile =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("file.txt")
+            .setContentGeneration(10L)
+            .build();
+    GcsItemId topDir = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dir/").build();
+    GcsItemId leadingSlashFile =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("/file.txt").build();
+    GcsItemId leadingSlashDir =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("/dir/").build();
+    GcsItemId nestedFile =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("a/b/file.txt")
+            .setContentGeneration(11L)
+            .build();
+    GcsItemId nestedDir =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/c/").build();
+    GcsItemId expectedNestedParent =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/").build();
+
+    assertThat(UriUtil.getParentId(GcsItemId.ROOT)).isEmpty();
+    assertThat(UriUtil.getParentId(bucket)).hasValue(GcsItemId.ROOT);
+    assertThat(UriUtil.getParentId(topFile)).hasValue(bucket);
+    assertThat(UriUtil.getParentId(topDir)).hasValue(bucket);
+    assertThat(UriUtil.getParentId(leadingSlashFile)).hasValue(bucket);
+    assertThat(UriUtil.getParentId(leadingSlashDir)).hasValue(bucket);
+    assertThat(UriUtil.getParentId(nestedFile)).hasValue(expectedNestedParent);
+    assertThat(UriUtil.getParentId(nestedDir)).hasValue(expectedNestedParent);
+    assertThrows(NullPointerException.class, () -> UriUtil.getParentId(null));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {".", "..", "./", "../", "a/./b", "a/../b", "a/.", "a/..", "/.", "/.."})
+  void hasDotSegment_pathsWithDotSegments_returnsTrue(String path) {
+    assertThat(UriUtil.hasDotSegment(path)).isTrue();
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {"", "/", "a/b/c", "a/.hidden", "a/..hidden", "a/...", "a/foo.", "a/foo.."})
+  void hasDotSegment_pathsWithoutDotSegments_returnsFalse(String path) {
+    assertThat(UriUtil.hasDotSegment(path)).isFalse();
+  }
+
+  @Test
+  void hasDotSegment_nullPath_returnsFalse() {
+    assertThat(UriUtil.hasDotSegment(null)).isFalse();
+  }
+
+  @Test
+  void getLeafName_variousItemTypes_returnsExpectedLeafWithoutTrailingSlash() {
+    GcsItemId bucket = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId topFile =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("file.txt").build();
+    GcsItemId nestedFile =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/file.txt").build();
+    GcsItemId topDir = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dir/").build();
+    GcsItemId nestedDir =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/b/dir/").build();
+    GcsItemId slashOnly = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("/").build();
+
+    assertThat(UriUtil.getLeafName(GcsItemId.ROOT)).isEmpty();
+    assertThat(UriUtil.getLeafName(bucket)).hasValue(TEST_BUCKET);
+    assertThat(UriUtil.getLeafName(topFile)).hasValue("file.txt");
+    assertThat(UriUtil.getLeafName(nestedFile)).hasValue("file.txt");
+    assertThat(UriUtil.getLeafName(topDir)).hasValue("dir");
+    assertThat(UriUtil.getLeafName(nestedDir)).hasValue("dir");
+    assertThat(UriUtil.getLeafName(slashOnly)).isEmpty();
+    assertThrows(NullPointerException.class, () -> UriUtil.getLeafName(null));
+  }
+
+  @Test
+  void isSubdirectory_sameBucketAndBoundaryCases_returnsExpectedResult() {
+    GcsItemId bucket = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId otherBucket = GcsItemId.builder().setBucketName("other-bucket").build();
+    GcsItemId dirA = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/").build();
+    GcsItemId dirAB = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("ab/").build();
+    GcsItemId child =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/sub/file").build();
+    GcsItemId otherBucketChild =
+        GcsItemId.builder().setBucketName("other-bucket").setObjectName("a/sub/").build();
+
+    assertThat(UriUtil.isSubdirectory(dirA, child)).isTrue();
+    assertThat(UriUtil.isSubdirectory(bucket, dirA)).isTrue();
+    assertThat(UriUtil.isSubdirectory(dirA, dirA)).isFalse();
+    assertThat(UriUtil.isSubdirectory(dirA, dirAB)).isFalse();
+    assertThat(UriUtil.isSubdirectory(dirA, bucket)).isFalse();
+    assertThat(UriUtil.isSubdirectory(bucket, bucket)).isFalse();
+    assertThat(UriUtil.isSubdirectory(dirA, otherBucketChild)).isFalse();
+    assertThat(UriUtil.isSubdirectory(GcsItemId.ROOT, bucket)).isFalse();
+    assertThat(UriUtil.isSubdirectory(otherBucket, GcsItemId.ROOT)).isFalse();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"", "/child", ".", "..", "sub/../escape", "sub/./file", "a//b", "a//"})
+  void validateRelativeChildPath_invalidPaths_throwsIOException(String invalidRelativePath) {
+    GcsItemId src =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("src/file").build();
+    GcsItemId dstDir = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dst/").build();
+
+    IOException e =
+        assertThrows(
+            IOException.class,
+            () -> UriUtil.validateRelativeChildPath(invalidRelativePath, src, dstDir));
+
+    assertThat(e).hasMessageThat().contains("invalid relative path");
+  }
+
+  @Test
+  void resolveChildId_validFileAndDirectoryUnderBucketAndSubdir_resolvesCleanly()
+      throws IOException {
+    GcsItemId src =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("src/item").build();
+    GcsItemId bucket = GcsItemId.builder().setBucketName(TEST_BUCKET).build();
+    GcsItemId subdir = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dst/").build();
+
+    assertThat(UriUtil.resolveChildId(bucket, "item", src, false))
+        .isEqualTo(GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("item").build());
+    assertThat(UriUtil.resolveChildId(bucket, "item", src, true))
+        .isEqualTo(GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("item/").build());
+    assertThat(UriUtil.resolveChildId(subdir, "item", src, false))
+        .isEqualTo(
+            GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dst/item").build());
+    assertThat(UriUtil.resolveChildId(subdir, "item", src, true))
+        .isEqualTo(
+            GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("dst/item/").build());
   }
 }

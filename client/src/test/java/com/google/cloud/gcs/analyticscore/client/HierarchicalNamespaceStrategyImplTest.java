@@ -296,6 +296,78 @@ class HierarchicalNamespaceStrategyImplTest {
     verify(mockClient, never()).getFolderInfo(any());
   }
 
+  @Test
+  void shouldRepairImplicitParentDirectory_returnsFalse() {
+    assertThat(strategy.shouldRepairImplicitParentDirectory()).isFalse();
+  }
+
+  @Test
+  void renameDirectory_validFolderIds_delegatesToRenameFolderNormalized() throws IOException {
+    GcsItemId src =
+        GcsItemId.builder()
+            .setBucketName(TEST_BUCKET)
+            .setObjectName("a/src")
+            .setContentGeneration(5L)
+            .build();
+    GcsItemId dst = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/dst").build();
+
+    strategy.renameDirectory(src, dst);
+
+    verify(mockClient)
+        .renameFolder(
+            GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/src/").build(),
+            GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("a/dst/").build());
+  }
+
+  @Test
+  void renameDirectory_leadingAndTrailingSpaceFolderNames_preservesSpacesVerbatim()
+      throws IOException {
+    GcsItemId src = createGcsItemId(" dir/");
+    GcsItemId dst = createGcsItemId("dir /");
+
+    strategy.renameDirectory(src, dst);
+
+    verify(mockClient).renameFolder(createGcsItemId(" dir/"), createGcsItemId("dir /"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {".", "..", "a/./b/", "a/../b/"})
+  void renameDirectory_dotSegmentInSource_throwsIOExceptionWithoutCallingClient(String invalidSrc) {
+    GcsItemId src =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(invalidSrc).build();
+    GcsItemId dst = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("clean/").build();
+
+    IOException e = assertThrows(IOException.class, () -> strategy.renameDirectory(src, dst));
+
+    assertThat(e).hasMessageThat().contains("source contains '.' or '..' path segment");
+    verifyNoInteractions(mockClient);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {".", "..", "a/./b/", "a/../b/"})
+  void renameDirectory_dotSegmentInDestination_throwsIOExceptionWithoutCallingClient(
+      String invalidDst) {
+    GcsItemId src = GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName("clean/").build();
+    GcsItemId dst =
+        GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(invalidDst).build();
+
+    IOException e = assertThrows(IOException.class, () -> strategy.renameDirectory(src, dst));
+
+    assertThat(e).hasMessageThat().contains("destination contains '.' or '..' path segment");
+    verifyNoInteractions(mockClient);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"/", "/dst/", "a//", "a//b/"})
+  void renameDirectory_malformedDestinationSlashes_throwsIllegalArgumentException(
+      String invalidDst) {
+    GcsItemId src = createGcsItemId("clean/");
+    GcsItemId dst = createGcsItemId(invalidDst);
+
+    assertThrows(IllegalArgumentException.class, () -> strategy.renameDirectory(src, dst));
+    verifyNoInteractions(mockClient);
+  }
+
   private static GcsItemId createGcsItemId(String objectName) {
     return GcsItemId.builder().setBucketName(TEST_BUCKET).setObjectName(objectName).build();
   }

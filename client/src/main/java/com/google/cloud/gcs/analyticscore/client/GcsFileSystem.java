@@ -298,4 +298,101 @@ public interface GcsFileSystem extends AutoCloseable {
   default void mkdirs(GcsItemId itemId) throws IOException {
     throw new UnsupportedOperationException("mkdirs is not supported by " + getClass().getName());
   }
+
+  /**
+   * Renames (moves) the file or directory at {@code src} to {@code dst} within the same bucket.
+   *
+   * <p>Semantics follow {@link #rename(GcsItemId, GcsItemId)}. {@code src} and {@code dst} are
+   * parsed as in {@link #getFileInfo(URI)}: their paths are percent-decoded, so {@code
+   * gs://bucket/a%20b.txt} names the object {@code a b.txt}. In an object name, write {@code %} as
+   * {@code %25}, {@code ?} as {@code %3F} and {@code #} as {@code %23}; {@link GcsItemId#toUri()}
+   * builds such a URI from a name.
+   *
+   * <p>The default implementation parses {@code src} and {@code dst} and calls {@link
+   * #rename(GcsItemId, GcsItemId)}.
+   *
+   * @param src the {@code gs://} URI of the existing file or directory to rename
+   * @param dst the {@code gs://} URI of the target path or existing destination directory
+   * @throws NullPointerException if {@code src} or {@code dst} is {@code null}
+   * @throws IllegalArgumentException if {@code src} or {@code dst} is not a valid {@code gs://} URI
+   *     (for example, {@code gs:///} or consecutive slashes), has a query or a fragment, or if
+   *     {@code src} is the global root ({@code gs:/})
+   * @throws UnsupportedOperationException if this implementation does not support {@link
+   *     #rename(GcsItemId, GcsItemId)}, if {@code src} and {@code dst} are in different buckets, if
+   *     {@code src} is a bucket, or if renaming a directory into the global root
+   * @throws FileNotFoundException if {@code src} does not exist, the parent of {@code dst} does not
+   *     exist, or renaming a file to a non-existent directory path ending in {@code "/"}
+   * @throws FileAlreadyExistsException if {@code dst} is an existing file (different from {@code
+   *     src}) or if the resolved target path inside an existing destination directory already
+   *     exists
+   * @throws AccessDeniedException if the caller lacks required GCS permissions
+   * @throws InterruptedIOException if the calling thread is interrupted while awaiting metadata
+   *     lookups, listing, batch moves, or folder rename completion
+   * @throws IOException if renaming a directory to itself or into its own subdirectory, if {@code
+   *     dst} (or a source/relative path on directory rename) contains {@code "."} or {@code ".."}
+   *     segments, if renaming a file into the global root, if a concurrent write creates the
+   *     destination between metadata lookup and {@code objects.move} (precondition failure), or if
+   *     another I/O error occurs
+   */
+  default void rename(URI src, URI dst) throws IOException {
+    rename(UriUtil.getItemIdFromUri(src), UriUtil.getItemIdFromUri(dst));
+  }
+
+  /**
+   * Renames (moves) the file or directory identified by {@code src} to {@code dst} within the same
+   * bucket.
+   *
+   * <p>Renames are move-only (no cross-bucket copy+delete): {@code src} and {@code dst} must belong
+   * to the same bucket. Any {@link GcsItemId#getContentGeneration()} on {@code src} or {@code dst}
+   * is ignored. Behavior depends on the types of {@code src} and {@code dst}:
+   *
+   * <ul>
+   *   <li><b>File to non-existent file path</b>: moves the object to {@code dst} via server-side
+   *       {@code objects.move} with overwrite protection.
+   *   <li><b>File or directory into an existing directory</b>: resolves the target to {@code
+   *       dst/<src-leaf-name>} and fails with {@link FileAlreadyExistsException} if an object or
+   *       directory already exists at the resolved target. Renaming an item to itself (for files)
+   *       or into its own parent directory is a no-op.
+   *   <li><b>Flat-namespace directory rename</b>: non-atomic multi-object move across all objects
+   *       under {@code src}. Objects matching {@link GcsFileSystemOptions#getMarkerFilePattern()}
+   *       are moved in a second phase only after all non-marker objects succeed. After a successful
+   *       rename, if {@link GcsFileSystemOptions#isAutoRepairImplicitDirectoriesEnabled()} is
+   *       {@code true}, the source's immediate parent directory is repaired best-effort if it was
+   *       implicit.
+   *   <li><b>Hierarchical namespace (HNS) directory rename</b>: atomic server-side native folder
+   *       rename via the Storage Control API; implicit parent repair is not needed and is skipped.
+   * </ul>
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}, so that
+   * implementations written against earlier versions of this interface keep compiling; {@link
+   * GcsFileSystemImpl} overrides it.
+   *
+   * @param src the GCS item identifier of the existing file or directory to rename; any content
+   *     generation is ignored
+   * @param dst the GCS item identifier of the target path or existing destination directory; any
+   *     content generation is ignored
+   * @throws NullPointerException if {@code src} or {@code dst} is {@code null}
+   * @throws IllegalArgumentException if {@code src} is {@link GcsItemId#ROOT}, either ID is
+   *     malformed, or {@code dst} is an object whose name starts with {@code "/"} or contains
+   *     consecutive {@code "/"} characters
+   * @throws UnsupportedOperationException if this implementation does not support renaming, if
+   *     {@code src} and {@code dst} are in different buckets, if {@code src} is a bucket, or if
+   *     renaming a directory into {@link GcsItemId#ROOT}
+   * @throws FileNotFoundException if {@code src} does not exist, the parent of {@code dst} does not
+   *     exist, or renaming a file to a non-existent directory path ending in {@code "/"}
+   * @throws FileAlreadyExistsException if {@code dst} is an existing file (different from {@code
+   *     src}) or if the resolved target path inside an existing destination directory already
+   *     exists
+   * @throws AccessDeniedException if the caller lacks required GCS permissions
+   * @throws InterruptedIOException if the calling thread is interrupted while awaiting metadata
+   *     lookups, listing, batch moves, or folder rename completion
+   * @throws IOException if renaming a directory to itself or into its own subdirectory, if {@code
+   *     dst} (or a source/relative path on directory rename) contains {@code "."} or {@code ".."}
+   *     segments, if renaming a file into {@link GcsItemId#ROOT}, if a concurrent write creates the
+   *     destination between metadata lookup and {@code objects.move} (precondition failure), or if
+   *     another I/O error occurs
+   */
+  default void rename(GcsItemId src, GcsItemId dst) throws IOException {
+    throw new UnsupportedOperationException("rename is not supported by " + getClass().getName());
+  }
 }
